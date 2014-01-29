@@ -1,0 +1,3 @@
+[submodule "tetris.js"]
+	path = tetris.js
+	url = git@github.com:bwindels/tetris.js.git
