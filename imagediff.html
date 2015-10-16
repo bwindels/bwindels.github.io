@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta charset="utf8"/>
+		<style>
+			body {
+				font-family: Helvetica, Arial;
+				font-size: 12px;
+			}
+
+			.sidebar, #main {
+				position: absolute;
+				top: 0;
+				left: 0;
+				bottom: 0;
+				overflow: hidden;
+			}
+
+			.sidebar {
+				background-color: #ddd;
+				width: 200px;
+			}
+
+			.sidebar #selectedImage {
+				display: block;
+				width: 100%;
+				min-height: 200px;
+			}
+
+			#main {
+				left: 200px;
+				right: 0;
+				overflow: scroll;
+			}
+
+			#main > img {
+				position: absolute;
+				top: 0;
+				left: 0;
+
+				-webkit-user-drag: none;
+				-moz-user-drag: none;
+				-ms-user-drag: none;
+
+				user-drag: none; 
+
+				-webkit-user-select: none;
+				-moz-user-select: none;
+				-ms-user-select: none;
+
+				user-select: none;
+
+				cursor: move;
+
+				ms-interpolation-mode: nearest-neighbor;
+				image-rendering: pixelated;
+				image-rendering: -moz-crisp-edges;
+			}
+
+			#main.blend-opacity > img {
+				-webkit-filter: opacity(50%);
+			}
+
+			#main.blend-subtract > img:nth-child(odd) {
+				-webkit-filter: invert(100%) opacity(50%);
+			}
+			#main.blend-subtract > img:nth-child(even) {
+				-webkit-filter: opacity(50%);
+			}
+
+			#main.blend-difference > img {
+				mix-blend-mode: difference;
+			}
+
+			#scaleText {
+				width: 30px;
+			}
+
+			#imageName {
+				white-space: nowrap;
+				overflow: hidden;
+				text-overflow: ellipsis;
+				font-size: 12px;
+				font-weight: bold;
+			}
+		</style>
+	</head>
+	<body>
+		<div class="sidebar">
+			<select size="5" id="selectedImage">
+				
+			</select>
+			<p><button id="addImage">Add image</button><button id="removeImage">Remove image</button></p>
+			<p>Blend mode: <select id="blendMode">
+				<option value="blend-opacity">Opacity</option>
+				<option value="blend-subtract">Subtract</option>
+				<option value="blend-difference">Difference</option>
+			</select></p>
+			<h2 id="imageName">No image selected</h2>
+			<p>Scale: <input type="text" id="scaleText"><input id="scaleRange" type="range" min="0.1" max="2" value="1" step="any"></p>
+		</div>
+		<div id="main" class="blend-opacity">
+			
+		</div>
+		<script type="text/javascript">
+		var __allImages = [];
+		var __currentImage;
+		var __draggingPosition = null;
+
+		var addImage = document.getElementById("addImage");
+		var removeImage = document.getElementById("removeImage");
+		var selectedImage = document.getElementById("selectedImage");
+		var blendMode = document.getElementById("blendMode");
+		var main = document.getElementById("main");
+		var scaleRange = document.getElementById("scaleRange");
+		var scaleText = document.getElementById("scaleText");
+		var imageNameHeader = document.getElementById("imageName");
+		
+		var createID = (function() {
+			var counter = 1000;
+			return function() {
+				++counter;
+				return counter;
+			};
+		}());
+
+		//Set blend mode
+		blendMode.addEventListener("change", function(event) {
+			main.className = blendMode.value;
+		});
+		//Set current image
+		selectedImage.addEventListener("change", function(event) {
+			var selectedId = parseInt(selectedImage.value, 10);
+			var image = __allImages.find(function(image) {
+				return image.id === selectedId;
+			});
+			if(image) {
+				setCurrentImage(image);
+			}
+		});
+		//Update image params
+		function updateScale(image, scale) {
+			if(image) {
+				image.scale = scale;
+				image.imageDomNode.setAttribute("width", Math.round(image.size.width * scale));
+				image.imageDomNode.setAttribute("height", Math.round(image.size.height * scale));
+			}
+			scaleRange.value = scale || 1;
+			scaleText.value = scale ? Math.round(scale * 1000) / 1000 : "";
+		}
+
+		function setCurrentImage(image) {
+			__currentImage = image;
+			updateScale(image, image && image.scale);
+			imageNameHeader.textContent = image ? image.file.name : "No image selected";
+			selectedImage.value = image.id;
+		}
+
+		scaleRange.addEventListener("input", function(event) {
+			if(!__currentImage) {
+				return;
+			}
+			updateScale(__currentImage, scaleRange.value);
+		}, false);
+
+		scaleText.addEventListener("change", function(event) {
+			if(!__currentImage) {
+				return;
+			}
+			var scale = parseFloat(scaleText.value);
+			if(!isNaN(scale)) {
+				updateScale(__currentImage, scale);
+			}
+			else {
+				alert("invalid scale value: " + scaleText.value);
+			}
+		}, false);
+
+		//Add image
+		function createImageFromFile(file) {
+			var id = createID();
+			var url = URL.createObjectURL(file);
+			var imageDomNode = document.createElement("img");
+			imageDomNode.src = url;
+			imageDomNode.setAttribute("draggable", "false");
+			var imageOptionNode = document.createElement("option");
+			imageOptionNode.value = id;
+			imageOptionNode.appendChild(document.createTextNode(file.name));
+
+			var result = {
+				id: id,
+				url: url,
+				file: file,
+				imageDomNode: imageDomNode,
+				imageOptionNode: imageOptionNode,
+				position: {x: 0, y: 0},
+				size: null,
+				scale: 1
+			};
+
+			return new Promise(function(resolve, reject) {
+				imageDomNode.onload = function() {
+					result.size = {width: imageDomNode.width, height: imageDomNode.height};
+					console.log(result);
+					resolve(result);
+				}
+				imageDomNode.onerror = function(event) {
+					reject(event);
+				}
+			});
+		}
+		
+		function addSelectedFilesAsImages(files) {
+			var newImagesPromises = files.map(createImageFromFile);
+			Promise.all(newImagesPromises).then(function(newImages) {
+				newImages.forEach(function(image) {
+					selectedImage.appendChild(image.imageOptionNode);
+					main.appendChild(image.imageDomNode);
+				});
+				__allImages = __allImages.concat(newImages);
+				var lastImage = newImages[newImages.length - 1];
+				setCurrentImage(lastImage);
+			});
+		}
+
+		addImage.addEventListener("click", function(event) {
+			var fileInput = document.createElement("input");
+			fileInput.setAttribute("type", "file");
+			fileInput.setAttribute("multiple", "multiple");
+			fileInput.addEventListener("change", function(event) {
+				var selectedFiles = [];
+				for(var i = 0; i < fileInput.files.length; ++i) {
+					selectedFiles.push(fileInput.files[i]);
+				}
+				addSelectedFilesAsImages(selectedFiles);
+			}, false);
+			fileInput.click();
+		}, false);
+
+		//Remove image
+		removeImage.addEventListener("click", function(event) {
+			if(!__currentImage) {
+				return;
+			}
+			__allImages = __allImages.filter(function(image) {
+				return image.id !== __currentImage.id;
+			});
+			main.removeChild(__currentImage.imageDomNode);
+			selectedImage.removeChild(__currentImage.imageOptionNode);
+			setCurrentImage(null);
+		}, false);
+
+		//Dragging
+		main.addEventListener("mousedown", function(event) {
+			if(!__currentImage) {
+				return;
+			}
+			__draggingPosition = {x: event.pageX, y: event.pageY};
+		});
+		main.addEventListener("mousemove", function(event) {
+			if(!__draggingPosition) {
+				return;
+			}
+			var cursorPos = {x: event.pageX, y: event.pageY};
+			var diff = {
+				x: cursorPos.x - __draggingPosition.x,
+				y: cursorPos.y - __draggingPosition.y
+			};
+			__draggingPosition = cursorPos;
+
+			__currentImage.position.x += diff.x;
+			__currentImage.position.y += diff.y;
+			__currentImage.imageDomNode.style.left = __currentImage.position.x + "px";
+			__currentImage.imageDomNode.style.top = __currentImage.position.y + "px";
+
+		});
+		main.addEventListener("mouseup", function(event) {
+			__draggingPosition = null;
+		});
+		
+		</script>
+	</body>
+</html>
