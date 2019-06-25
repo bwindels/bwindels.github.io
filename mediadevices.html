@@ -6,7 +6,8 @@
 	<body>
 		<p>
 			<button id="doListDevices">List devices</button>
-			<button id="doMediaButton">Open media</button>
+			<button id="doAButton">Open Audio media</button>
+			<button id="doAVButton">Open A/V media</button>
 		</p>
 		<form name="devices">
 			<ul id="list"></ul>
@@ -33,7 +34,8 @@
 			const requestedConstraintsLabel = document.getElementById("requested-constraints");
 			const obtainedConstraintsLabel = document.getElementById("obtained-constraints");
 			const doListDevices = document.getElementById("doListDevices");
-			const doMediaButton = document.getElementById("doMediaButton");
+			const doAVButton = document.getElementById("doAVButton");
+			const doAButton = document.getElementById("doAButton");
 			const list = document.getElementById("list");
 			doListDevices.addEventListener("click", async () => {
 				const devices = await navigator.mediaDevices.enumerateDevices();
@@ -68,8 +70,7 @@
 				}
 			}, true);
 
-
-			doMediaButton.addEventListener("click", async () => {
+			async function doMedia(doAudio, doVideo) {
 				errorLabel.innerText = "";
 				obtainedConstraintsLabel.innerText = "";
 				const audioInputRadio = document.querySelector('input[name="audioinput"]:checked');
@@ -77,17 +78,21 @@
 				const audioInput = audioInputRadio && audioInputRadio.value;
 				const videoInput = videoInputRadio && videoInputRadio.value;
 		    	const isWebkit = !!window.navigator.webkitGetUserMedia;
-		    	console.log({videoInputRadio, audioInputRadio});
-		    	const constraints = {
-					audio: audioInput ? { deviceId: { ideal: audioInput} } : true,
-					video: {
+
+		    	const constraints = {};
+		    	if (doAudio) {
+					constraints.audio = audioInput ? { deviceId: { ideal: audioInput} } : true;
+		    	}
+		    	if (doVideo) {
+					constraints.video = {
 						width: isWebkit ? { exact: 640 } : 640,
                     	height: isWebkit ? { exact: 360 } : 360,
-	                }
-				};
-				if (videoInput) {
-					constraints.video.deviceId = { ideal: videoInput };
+	                };
+					if (videoInput) {
+						constraints.video.deviceId = { ideal: videoInput };
+					}
 				}
+
 				requestedConstraintsLabel.innerText = JSON.stringify(constraints, undefined, 2);
 				try {
 					const mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
@@ -105,7 +110,11 @@
 				} catch(err) {
 					errorLabel.innerText = `Error: ${err.message} (${err.name})\n${err.stack}`;
 				}
-			}, true);
+			}
+
+
+			doAVButton.addEventListener("click", () => doMedia(true, true), true);
+			doAButton.addEventListener("click", () => doMedia(true, false), true);
 		</script>
 	</body>
 </html>
