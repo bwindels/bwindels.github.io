@@ -12,7 +12,26 @@
 			<ul id="list"></ul>
 		</form>
 		<video></video>
+		<fieldset>
+			<legend>Error</legend>
+			<pre style="color:red" id="error"></pre>
+		</fieldset>
+		<fieldset>
+			<legend>requested constraints</legend>
+			<pre id="requested-constraints"></pre>
+		</fieldset>
+		<fieldset>
+			<legend>obtained tracks with constraints</legend>
+			<pre id="obtained-constraints"></pre>
+		</fieldset>
+		<fieldset>
+			<legend>getSupportedConstraints()</legend>
+			<script type="text/javascript">document.write(`<pre>${JSON.stringify(navigator.mediaDevices.getSupportedConstraints && navigator.mediaDevices.getSupportedConstraints(), undefined, 2)}</pre>`);</script>
+		</fieldset>
 		<script type="text/javascript">
+			const errorLabel = document.getElementById("error");
+			const requestedConstraintsLabel = document.getElementById("requested-constraints");
+			const obtainedConstraintsLabel = document.getElementById("obtained-constraints");
 			const doListDevices = document.getElementById("doListDevices");
 			const doMediaButton = document.getElementById("doMediaButton");
 			const list = document.getElementById("list");
@@ -31,7 +50,7 @@
 					li.appendChild(document.createTextNode(key));
 					list.appendChild(li);
 					for (const d of value) {
-						const label = `"${d.label}" (kind=${d.kind}, deviceId=${d.deviceId})`;
+						const label = `"${d.label}" (deviceId=${d.deviceId})`;
 						const textNode = document.createTextNode(label);
 						const labelNode = document.createElement("label");
 						labelNode.setAttribute("for", d.deviceId);
@@ -51,31 +70,40 @@
 
 
 			doMediaButton.addEventListener("click", async () => {
-				const form = document.forms["devices"];
-				const audioInput = form["audioinput"] && form["audioinput"].value;
-				const videoInput = form["videoinput"] && form["videoinput"].value;
+				errorLabel.innerText = "";
+				obtainedConstraintsLabel.innerText = "";
+				const audioInputRadio = document.querySelector('input[name="audioinput"]:checked');
+				const videoInputRadio = document.querySelector('input[name="videoinput"]:checked');
+				const audioInput = audioInputRadio && audioInputRadio.value;
+				const videoInput = videoInputRadio && videoInputRadio.value;
 		    	const isWebkit = !!window.navigator.webkitGetUserMedia;
-				const constraints = {
-					audio: {
-	                    deviceId: audioInput ? {ideal: audioInput} : undefined,
-	                }, video: {
-	                    deviceId: videoInput ? {ideal: videoInput} : undefined,
-	                    /* We want 640x360.  Chrome will give it only if we ask exactly,
-	                       FF refuses entirely if we ask exactly, so have to ask for ideal
-	                       instead */
-	                    width: isWebkit ? { exact: 640 } : { ideal: 640 },
-	                    height: isWebkit ? { exact: 360 } : { ideal: 360 },
+		    	console.log({videoInputRadio, audioInputRadio});
+		    	const constraints = {
+					audio: audioInput ? { deviceId: { ideal: audioInput} } : true,
+					video: {
+						width: isWebkit ? { exact: 640 } : 640,
+                    	height: isWebkit ? { exact: 360 } : 360,
 	                }
 				};
-
+				if (videoInput) {
+					constraints.video.deviceId = { ideal: videoInput };
+				}
+				requestedConstraintsLabel.innerText = JSON.stringify(constraints, undefined, 2);
 				try {
 					const mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+					const tracks = mediaStream.getTracks();
+					const obtainedConfig = tracks.reduce((agg, t) => {
+						const constraints = t.getConstraints();
+						const {label, kind, id} = t;
+						agg.push({label, kind, id, constraints});
+						return agg;
+					}, []);
+					obtainedConstraintsLabel.innerText = JSON.stringify(obtainedConfig, undefined, 2);
 					const video = document.querySelector('video');
 					video.srcObject = mediaStream;
 					video.onloadedmetadata = () => video.play();
 				} catch(err) {
-					alert(err.message);
-					console.error(err);
+					errorLabel.innerText = `Error: ${err.message} (${err.name})\n${err.stack}`;
 				}
 			}, true);
 		</script>
