@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta charset="utf-8">
+	</head>
+	<body>
+		<p>
+			<button id="doListDevices">List devices</button>
+			<button id="doMediaButton">Open media</button>
+		</p>
+		<form name="devices">
+			<ul id="list"></ul>
+		</form>
+		<video></video>
+		<script type="text/javascript">
+			const doListDevices = document.getElementById("doListDevices");
+			const doMediaButton = document.getElementById("doMediaButton");
+			const list = document.getElementById("list");
+			doListDevices.addEventListener("click", async () => {
+				const devices = await navigator.mediaDevices.enumerateDevices();
+				console.log(devices);
+				const devicesByKind = devices.reduce((groups, d) => {
+					let group = groups[d.kind] || [];
+					groups[d.kind] = group;
+					group.push(d);
+					return groups;
+				}, {});
+				list.innerHTML = "";
+				for(const [key, value] of Object.entries(devicesByKind)) {
+					const li = document.createElement("li");
+					li.appendChild(document.createTextNode(key));
+					list.appendChild(li);
+					for (const d of value) {
+						const label = `"${d.label}" (kind=${d.kind}, deviceId=${d.deviceId})`;
+						const textNode = document.createTextNode(label);
+						const labelNode = document.createElement("label");
+						labelNode.setAttribute("for", d.deviceId);
+						labelNode.appendChild(textNode);
+						const deviceIdOption = document.createElement("input");
+						deviceIdOption.setAttribute("type", "radio");
+						deviceIdOption.setAttribute("name", d.kind);
+						deviceIdOption.setAttribute("value", d.deviceId);
+						deviceIdOption.setAttribute("id", d.deviceId);
+						const li = document.createElement("li");
+						li.appendChild(deviceIdOption);
+						li.appendChild(labelNode);
+						list.appendChild(li);
+					}
+				}
+			}, true);
+
+
+			doMediaButton.addEventListener("click", async () => {
+				const form = document.forms["devices"];
+				const audioInput = form["audioinput"] && form["audioinput"].value;
+				const videoInput = form["videoinput"] && form["videoinput"].value;
+		    	const isWebkit = !!window.navigator.webkitGetUserMedia;
+				const constraints = {
+					audio: {
+	                    deviceId: audioInput ? {ideal: audioInput} : undefined,
+	                }, video: {
+	                    deviceId: videoInput ? {ideal: videoInput} : undefined,
+	                    /* We want 640x360.  Chrome will give it only if we ask exactly,
+	                       FF refuses entirely if we ask exactly, so have to ask for ideal
+	                       instead */
+	                    width: isWebkit ? { exact: 640 } : { ideal: 640 },
+	                    height: isWebkit ? { exact: 360 } : { ideal: 360 },
+	                }
+				};
+
+				try {
+					const mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+				} catch(err) {
+					alert(err.message);
+					console.error(err);
+				}
+				const video = document.querySelector('video');
+				video.srcObject = mediaStream;
+				video.onloadedmetadata = () => video.play();
+			}, true);
+		</script>
+	</body>
+</html>
