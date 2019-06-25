@@ -70,13 +70,13 @@
 
 				try {
 					const mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+					const video = document.querySelector('video');
+					video.srcObject = mediaStream;
+					video.onloadedmetadata = () => video.play();
 				} catch(err) {
 					alert(err.message);
 					console.error(err);
 				}
-				const video = document.querySelector('video');
-				video.srcObject = mediaStream;
-				video.onloadedmetadata = () => video.play();
 			}, true);
 		</script>
 	</body>
