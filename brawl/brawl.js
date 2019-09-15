@@ -3023,7 +3023,6 @@ var main = (function () {
                 });
                 pendingEventsStore.add(pendingEvent.data);
             } catch (err) {
-                console.error("SendQueue: could not create event", err);
                 txn.abort();
                 throw err;
             }
@@ -4096,7 +4095,13 @@ var main = (function () {
 
         sendMessage(message) {
             if (message) {
-                this._room.sendEvent("m.room.message", {msgtype: "m.text", body: message});
+                try {
+                    this._room.sendEvent("m.room.message", {msgtype: "m.text", body: message});
+                } catch (err) {
+                    console.error(`room.sendMessage(): ${err.message}:\n${err.stack}`);
+                    this._timelineError = err;
+                    this.emit("change", "error");
+                }
             }
         }
     }
