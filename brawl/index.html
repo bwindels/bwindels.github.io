@@ -5,7 +5,19 @@
         <link rel="stylesheet" type="text/css" href="brawl.css">
 	</head>
 	<body>
-		<script type="text/javascript" src="brawl.js"></script><script type="text/javascript">main(document.body);</script>
+		<script type="text/javascript" src="brawl.js"></script><script type="text/javascript">
+window.DEBUG = true;
+let buf = "";
+console.error = (...params) => {
+    const lastLines = "...\n" + buf.split("\n").slice(-10).join("\n");
+    // buf = buf + "ERR " + params.join(" ") + "\n";
+    // const location = new Error().stack.split("\n")[2];
+    alert(params.join(" ") +"\n...\n" + lastLines);
+};
+console.log = console.info = console.warn = (...params) => {
+    buf = buf + params.join(" ") + "\n";
+};
+ main(document.body);</script>
 	
 
 </body></html>
