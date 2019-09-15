@@ -1,17 +1,31 @@
 const VERSION = "0.0.1";
 const FILES = ["brawl.js","brawl.css","index.html"];
+const cacheName = `brawl-${VERSION}`;
+
 self.addEventListener('install', function(e) {
     e.waitUntil(
-        caches.open(`brawl-${VERSION}`).then(function(cache) {
+        caches.open(cacheName).then(function(cache) {
             return cache.addAll(FILES);
         })
     );
 });
 
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys().then((keyList) => {
+      return Promise.all(keyList.map((key) => {
+        if (key !== cacheName) {
+          return caches.delete(key);
+        }
+      }));
+    })
+  );
+});
+
 self.addEventListener('fetch', (event) => {
   event.respondWith(
-    caches.match(event.request).then((response) => {
-      return response || fetch(event.request);
-    })
+    caches.open(cacheName)
+        .then(cache => cache.match(event.request))
+        .then((response) => response || fetch(event.request))
   );
 });
