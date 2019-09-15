@@ -1,5 +1,5 @@
 const VERSION = "0.0.1";
-const FILES = ["brawl.js","brawl.css","index.html"];
+const FILES = ["brawl.js","brawl.css","index.html","/"];
 const cacheName = `brawl-${VERSION}`;
 
 self.addEventListener('install', function(e) {
