@@ -3023,6 +3023,7 @@ var main = (function () {
                 });
                 pendingEventsStore.add(pendingEvent.data);
             } catch (err) {
+                console.error("SendQueue: could not create event", err);
                 txn.abort();
                 throw err;
             }
