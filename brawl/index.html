@@ -1,4 +1,4 @@
-<!DOCTYPE html><html><head>
+<!DOCTYPE html><html manifest="manifest.appcache"><head>
 		<meta charset="utf-8">
         <meta name="viewport" content="width=device-width, user-scalable=no">
         <meta name="application-name" content="Brawl Chat">
@@ -33,12 +33,7 @@
                 showlogs.innerText = "Show last 20 log lines";
             }, 5000);
         </script>
-        <script id="service-worker" type="text/javascript">
-            if('serviceWorker' in navigator) {
-                navigator.serviceWorker.register('sw.js')
-                    .then(function() { console.log("Service Worker registered"); });
-            }
-        </script>        
+                
 	
 
 </body></html>

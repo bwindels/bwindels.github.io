@@ -1,5 +1,8 @@
 CACHE MANIFEST
-# v0.0.3
+# v0.0.1
+NETWORK
+"*"
+CACHE
 brawl.js
 brawl.css
 index.html
