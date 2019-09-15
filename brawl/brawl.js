@@ -70,9 +70,9 @@ var main = (function () {
             const url = this._url(`${csPath}?${queryString}`);
             let bodyString;
             const headers = new Headers();
-            if (this._accessToken) {
-                headers.append("Authorization", `Bearer ${this._accessToken}`);
-            }
+            // if (this._accessToken) {
+            //     headers.append("Authorization", `Bearer ${this._accessToken}`);
+            // }
             headers.append("Accept", "application/json");
             if (body) {
                 headers.append("Content-Type", "application/json");
