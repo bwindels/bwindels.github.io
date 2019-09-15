@@ -17,7 +17,16 @@ console.error = (...params) => {
 console.log = console.info = console.warn = (...params) => {
     buf = buf + params.join(" ") + "\n";
 };
- main(document.body);</script>
+ main(document.body); 
+setTimeout(() => {
+    const showlogs = document.getElementById("showlogs");
+    showlogs.addEventListener("click", () => {
+        const lastLines = "...\n" + buf.split("\n").slice(-20).join("\n");
+        alert(lastLines);
+    }, true);
+    showlogs.innerText = "Show last 20 log lines";
+}, 1000);
+</script>
 	
 
 </body></html>
