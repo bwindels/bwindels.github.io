@@ -1,0 +1,289 @@
+html {
+    height: 100%;
+}
+body {
+    margin: 0;
+}
+.SessionView {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+}
+.SessionView > .main {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+    min-width: 0;
+    width: 100vw;
+}
+/* mobile layout */
+@media screen and (max-width: 800px) {
+    .RoomHeader button.back { display: block; }
+    div.RoomView, div.RoomPlaceholderView { display: none; }
+    div.LeftPanel {flex-grow: 1;}
+    div.room-shown div.RoomView { display: flex; }
+    div.room-shown div.LeftPanel { display: none; }
+    div.right-shown div.TimelinePanel { display: none; }
+}
+.LeftPanel {
+    flex: 0 0 300px;
+    min-width: 0;
+}
+.RoomPlaceholderView, .RoomView {
+    flex: 1 0 0;
+    min-width: 0;
+}
+.RoomView {
+    min-width: 0;
+    display: flex;
+}
+.TimelinePanel {
+    flex: 3;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+}
+.TimelinePanel ul {
+    flex: 1 0 0;
+}
+.RoomHeader {
+    display: flex;
+}
+.LeftPanel {
+    background: #333;
+    color: white;
+    overflow-y: auto;
+}
+.LeftPanel ul {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+.LeftPanel li {
+    margin: 5px;
+    padding: 10px;
+    display: flex;
+    align-items: center;
+}
+.LeftPanel li {
+    border-bottom: 1px #555 solid;
+}
+.LeftPanel li:last-child {
+    border-bottom: none;
+}
+.LeftPanel li > * {
+    margin-right: 10px;
+}
+.LeftPanel div.description {
+    margin: 0;
+    flex: 1 1 0;
+    min-width: 0;
+}
+.LeftPanel .description > * {
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+.LeftPanel .description .last-message {
+    font-size: 0.8em;
+}
+.RoomHeader {
+    padding: 10px;
+    background-color: #333;
+}
+.RoomHeader > *:last-child {
+    margin-right: 0;
+}
+.RoomHeader > * {
+    margin-right: 10px;
+    flex: 0 0 auto;
+}
+.RoomHeader button {
+    width: 40px;
+    height: 40px;
+    display: none;
+    font-size: 1.5em;
+    padding: 0;
+    display: block;
+    background: white;
+    border: none;
+    font-weight: bolder;
+    line-height: 40px;
+}
+.RoomHeader .back {
+    display: none;
+}
+.RoomHeader .room-description {
+    flex: 1 1 0;
+    min-width: 0;
+}
+.RoomHeader .topic {
+    font-size: 0.8em;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+.back::before {
+    content: "☰";
+}
+.more::before {
+    content: "⋮";
+}
+.RoomHeader {
+    align-items: center;
+}
+.RoomHeader .description {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+.RoomHeader h2 {
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    margin: 0;
+}
+.RoomView_error {
+    color: red;
+}
+.MessageComposer > input {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0.8em;
+    border: none;
+}
+.TimelinePanel ul {
+    overflow-y: auto;
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+.TimelinePanel li {
+}
+.message-container {
+    flex: 0 1 auto;
+    max-width: 80%;
+    padding: 5px 10px;
+    margin: 5px 10px;
+    background: blue;
+    word-break: break-word;
+}
+.message-container .sender {
+    margin: 5px 0;
+    font-size: 0.9em;
+    font-weight: bold;
+}
+.TextMessageView {
+    display: flex;
+    min-width: 0;
+}
+.TextMessageView.own .message-container {
+    margin-left: auto;
+}
+.TextMessageView .message-container time {
+    float: right;
+    padding: 2px 0 0px 20px;
+    font-size: 0.9em;
+    color: lightblue;
+}
+.message-container time {
+    font-size: 0.9em;
+    color: lightblue;
+}
+.own time {
+    color: lightgreen;
+}
+.own .message-container {
+    background-color: darkgreen;
+}
+.TextMessageView.pending .message-container {
+    background-color: #333;
+}
+.message-container p {
+    margin: 5px 0;
+}
+.AnnouncementView {
+    margin: 5px 0;
+    padding: 5px 10%;
+    display: flex;
+    align-items: center;
+}
+.AnnouncementView > div {
+    margin: 0 auto;
+    padding: 10px 20px;
+    background-color: #333;
+    font-size: 0.9em;
+    color: #CCC;
+    text-align: center;
+}
+.avatar {
+    --avatar-size: 32px;
+    width: var(--avatar-size);
+    height: var(--avatar-size);
+    border-radius: 100px;
+    overflow: hidden;
+    flex-shrink: 0;
+    -moz-user-select: none;
+    -webkit-user-select: none;
+    -ms-user-select: none;
+    user-select: none;
+    line-height: var(--avatar-size);
+    font-size: calc(var(--avatar-size) * 0.6);
+    text-align: center;
+    letter-spacing: calc(var(--avatar-size) * -0.05);
+    background: white;
+    color: black;
+}
+.avatar.large {
+    --avatar-size: 40px;
+}
+.avatar img {
+    width: 100%;
+    height: 100%;
+}
+body {
+    margin: 0;
+    font-family: sans-serif;
+    background-color: black;
+    color: white;
+}
+.SyncStatusBar {
+    background-color: #555;
+    display: none;
+}
+.SyncStatusBar_shown {
+    display: unset;
+}
+.RoomPlaceholderView {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: row;
+}
+.SessionPickerView {
+  padding: 0.4em;
+}
+.SessionPickerView ul {
+  list-style: none;
+  padding: 0;
+}
+.SessionPickerView li {
+  margin: 0.4em 0;
+  font-size: 1.2em;
+  background-color: grey;
+  padding: 0.5em;
+  cursor: pointer;
+}
+.LoginView {
+  padding: 0.4em;
+}
+.form > div {
+  margin: 0.4em 0;
+}
+.form input {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+}
+
