@@ -266,6 +266,10 @@ var main = (function () {
             }
         }
 
+        supports(methodName) {
+            return this._target.supports(methodName);
+        }
+
         get(key) {
             return reqAsPromise(this._target.get(key));
         }
@@ -416,9 +420,13 @@ var main = (function () {
         constructor(qt) {
             this._qt = qt;
         }
+
+        supports(methodName) {
+            return !!this._qt[methodName];
+        }
         
         openKeyCursor(...params) {
-            // not supported on Windows Phone 10
+            // not supported on Edge 15
             if (!this._qt.openKeyCursor) {
                 return this.openCursor(...params);
             }
@@ -1000,7 +1008,14 @@ var main = (function () {
 
         async exists(roomId, queueIndex) {
             const keyRange = IDBKeyRange.only(encodeKey$2(roomId, queueIndex));
-            const key = await this._eventStore.getKey(keyRange);
+            let key;
+            if (this._eventStore.supports("getKey")) {
+                key = await this._eventStore.getKey(keyRange);
+            } else {
+                console.info("falling back to eventStore.get, no getKey");
+                const value = await this._eventStore.get(keyRange);
+                key = value && value.key;
+            }
             return !!key;
         }
         
