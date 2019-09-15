@@ -328,6 +328,7 @@ var main = (function () {
             const cursor = this._target.openKeyCursor(range, "prev");
             let maxKey;
             await iterateCursor(cursor, (_, key) => {
+                console.log("findMaxKey", key);
                 maxKey = key;
                 return {done: true};
             });
@@ -979,7 +980,10 @@ var main = (function () {
             );
             const maxKey = await this._eventStore.findMaxKey(range);
             if (maxKey) {
+                console.log("getMaxQueueIndex: got key!");
                 return decodeKey(maxKey).queueIndex;
+            } else {
+                console.log("getMaxQueueIndex: no key :(");
             }
         }
 
@@ -3014,7 +3018,9 @@ var main = (function () {
             let pendingEvent;
             try {
                 const pendingEventsStore = txn.pendingEvents;
+                console.log("_createAndStoreEvent getting maxQueueIndex");
                 const maxQueueIndex = await pendingEventsStore.getMaxQueueIndex(this._roomId) || 0;
+                console.log("_createAndStoreEvent got maxQueueIndex", maxQueueIndex);
                 const queueIndex = maxQueueIndex + 1;
                 pendingEvent = new PendingEvent({
                     roomId: this._roomId,
