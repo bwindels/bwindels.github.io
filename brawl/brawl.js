@@ -222,14 +222,14 @@ var main = (function () {
         });
     }
 
-    function iterateCursor(cursor, processValue) {
+    function iterateCursor(cursorRequest, processValue) {
         // TODO: does cursor already have a value here??
         return new Promise((resolve, reject) => {
-            cursor.onerror = (event) => {
-                reject(new Error("Query failed: " + event.target.errorCode));
+            cursorRequest.onerror = () => {
+                reject(new StorageError("Query failed", cursorRequest.error));
             };
             // collect results
-            cursor.onsuccess = (event) => {
+            cursorRequest.onsuccess = (event) => {
                 const cursor = event.target.result;
                 if (!cursor) {
                     resolve(false);
@@ -419,8 +419,10 @@ var main = (function () {
         
         openKeyCursor(...params) {
             try {
+                console.log("openKeyCursor", this._qt.openKeyCursor);
                 return this._qt.openKeyCursor(...params);
             } catch(err) {
+                console.error("openKeyCursor failed", err);
                 throw new StorageError("openKeyCursor failed", err);
             }
         }
@@ -978,6 +980,8 @@ var main = (function () {
                 false,
                 false,
             );
+            console.log("finding max key between", encodeKey$2(roomId, Platform.minStorageKey),
+                encodeKey$2(roomId, Platform.maxStorageKey));
             const maxKey = await this._eventStore.findMaxKey(range);
             if (maxKey) {
                 console.log("getMaxQueueIndex: got key!");
