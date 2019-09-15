@@ -2909,7 +2909,7 @@ var main = (function () {
             this._isSending = true;
             try {
                 console.log("start sending", this._amountSent, "<", this._pendingEvents.length);
-                while (this._amountSent < this._pendingEvents.length) {
+                while (this._pendingEvents.length && this._amountSent < this._pendingEvents.length) {
                     const pendingEvent = this._pendingEvents.get(this._amountSent);
                     console.log("trying to send", pendingEvent.content.body);
                     this._amountSent += 1;
@@ -2977,6 +2977,7 @@ var main = (function () {
         async enqueueEvent(eventType, content) {
             const pendingEvent = await this._createAndStoreEvent(eventType, content);
             this._pendingEvents.set(pendingEvent);
+            console.log("added to _pendingEvents set", this._pendingEvents.length);
             if (!this._isSending && !this._offline) {
                 this._sendLoop();
             }
@@ -3008,6 +3009,7 @@ var main = (function () {
         }
 
         async _createAndStoreEvent(eventType, content) {
+            console.log("_createAndStoreEvent");
             const txn = await this._storage.readWriteTxn([this._storage.storeNames.pendingEvents]);
             let pendingEvent;
             try {
@@ -3021,6 +3023,7 @@ var main = (function () {
                     content,
                     txnId: makeTxnId()
                 });
+                console.log("_createAndStoreEvent: adding to pendingEventsStore");
                 pendingEventsStore.add(pendingEvent.data);
             } catch (err) {
                 txn.abort();
@@ -4101,8 +4104,11 @@ var main = (function () {
                     console.error(`room.sendMessage(): ${err.message}:\n${err.stack}`);
                     this._timelineError = err;
                     this.emit("change", "error");
+                    return false;
                 }
+                return true;
             }
+            return false;
         }
     }
 
@@ -5030,8 +5036,9 @@ var main = (function () {
 
         _onKeyDown(event) {
             if (event.key === "Enter") {
-                this.viewModel.sendMessage(this._input.value);
-                this._input.value = "";
+                if (this.viewModel.sendMessage(this._input.value)) {
+                    this._input.value = "";
+                }
             }
         }
     }
