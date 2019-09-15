@@ -84,7 +84,8 @@ var main = (function () {
                 method,
                 headers,
                 body: bodyString,
-                signal: controller && controller.signal
+                signal: controller && controller.signal,
+                mode: "cors"
             });
             promise = promise.then(async (response) => {
                 if (response.ok) {
