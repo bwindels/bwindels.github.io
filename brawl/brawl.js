@@ -418,11 +418,13 @@ var main = (function () {
         }
         
         openKeyCursor(...params) {
+            // not supported on Windows Phone 10
+            if (!this._qt.openKeyCursor) {
+                return this.openCursor(...params);
+            }
             try {
-                console.log("openKeyCursor", this._qt.openKeyCursor);
                 return this._qt.openKeyCursor(...params);
             } catch(err) {
-                console.error("openKeyCursor failed", err);
                 throw new StorageError("openKeyCursor failed", err);
             }
         }
