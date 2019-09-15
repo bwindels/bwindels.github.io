@@ -332,7 +332,6 @@ var main = (function () {
             const cursor = this._target.openKeyCursor(range, "prev");
             let maxKey;
             await iterateCursor(cursor, (_, key) => {
-                console.log("findMaxKey", key);
                 maxKey = key;
                 return {done: true};
             });
@@ -990,14 +989,9 @@ var main = (function () {
                 false,
                 false,
             );
-            console.log("finding max key between", encodeKey$2(roomId, Platform.minStorageKey),
-                encodeKey$2(roomId, Platform.maxStorageKey));
             const maxKey = await this._eventStore.findMaxKey(range);
             if (maxKey) {
-                console.log("getMaxQueueIndex: got key!");
                 return decodeKey(maxKey).queueIndex;
-            } else {
-                console.log("getMaxQueueIndex: no key :(");
             }
         }
 
@@ -1012,7 +1006,6 @@ var main = (function () {
             if (this._eventStore.supports("getKey")) {
                 key = await this._eventStore.getKey(keyRange);
             } else {
-                console.info("falling back to eventStore.get, no getKey");
                 const value = await this._eventStore.get(keyRange);
                 key = value && value.key;
             }
@@ -2934,7 +2927,7 @@ var main = (function () {
             this._isSending = true;
             try {
                 console.log("start sending", this._amountSent, "<", this._pendingEvents.length);
-                while (this._pendingEvents.length && this._amountSent < this._pendingEvents.length) {
+                while (this._amountSent < this._pendingEvents.length) {
                     const pendingEvent = this._pendingEvents.get(this._amountSent);
                     console.log("trying to send", pendingEvent.content.body);
                     this._amountSent += 1;
