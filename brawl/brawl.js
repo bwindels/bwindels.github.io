@@ -86,7 +86,9 @@ var main = (function () {
                 body: bodyString,
                 signal: controller && controller.signal,
                 mode: "cors",
-                credentials: "omit"
+                credentials: "omit",
+                referrer: "no-referrer",
+                cache: "no-cache",
             });
             promise = promise.then(async (response) => {
                 if (response.ok) {
