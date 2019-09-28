@@ -4255,6 +4255,7 @@ var main = (function () {
                 this._loading = true;
                 this.emit("change", "loading");
                 const loginData = await hsApi.passwordLogin(username, password).response();
+                loginData.homeServerUrl = homeserver;
                 this._loginCallback(loginData);
                 // wait for parent view model to switch away here
             } catch (err) {
@@ -4340,7 +4341,7 @@ var main = (function () {
             this._clearSections();
             this._loginViewModel = new LoginViewModel({
                 createHsApi: this._createHsApi,
-                defaultHomeServer: "matrix.org",
+                defaultHomeServer: "https://matrix.org",
                 loginCallback: loginData => this._onLoginFinished(loginData)
             });
             this.emit("change", "activeSection");
@@ -4389,7 +4390,7 @@ var main = (function () {
                     id: sessionId,
                     deviceId: loginData.device_id,
                     userId: loginData.user_id,
-                    homeServer: loginData.home_server,
+                    homeServer: loginData.homeServerUrl,
                     accessToken: loginData.access_token,
                     lastUsed: this._clock.now()
                 };
@@ -5358,7 +5359,7 @@ var main = (function () {
         try {
             const vm = new BrawlViewModel({
                 createStorage: sessionId => createIdbStorage(`brawl_session_${sessionId}`),
-                createHsApi: (homeServer, accessToken = null) => new HomeServerApi(`https://${homeServer}`, accessToken),
+                createHsApi: (homeServer, accessToken = null) => new HomeServerApi(homeServer, accessToken),
                 sessionStore: new SessionsStore("brawl_sessions_v1"),
                 clock: Date //just for `now` fn
             });
