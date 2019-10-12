@@ -278,6 +278,13 @@ body {
   background-color: grey;
   padding: 0.5em;
   cursor: pointer;
+  display: flex;
+}
+.SessionPickerView li span.userId {
+  flex: 1;
+}
+.SessionPickerView li span.error {
+  margin: 0 20px;
 }
 .LoginView {
   padding: 0.4em;

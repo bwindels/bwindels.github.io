@@ -65,7 +65,12 @@ var main = (function () {
         _request(method, csPath, queryParams = {}, body) {
             const queryString = Object.entries(queryParams)
                 .filter(([, value]) => value !== undefined)
-                .map(([name, value]) => `${encodeURIComponent(name)}=${encodeURIComponent(value)}`)
+                .map(([name, value]) => {
+                    if (typeof value === "object") {
+                        value = JSON.stringify(value);
+                    }
+                    return `${encodeURIComponent(name)}=${encodeURIComponent(value)}`;
+                })
                 .join("&");
             const url = this._url(`${csPath}?${queryString}`);
             let bodyString;
@@ -134,11 +139,11 @@ var main = (function () {
 
         // params is from, dir and optionally to, limit, filter.
         messages(roomId, params) {
-            return this._get(`/rooms/${roomId}/messages`, params);
+            return this._get(`/rooms/${encodeURIComponent(roomId)}/messages`, params);
         }
 
         send(roomId, eventType, txnId, content) {
-            return this._put(`/rooms/${roomId}/send/${eventType}/${txnId}`, {}, content);
+            return this._put(`/rooms/${encodeURIComponent(roomId)}/send/${encodeURIComponent(eventType)}/${encodeURIComponent(txnId)}`, {}, content);
         }
 
         passwordLogin(username, password) {
@@ -150,6 +155,10 @@ var main = (function () {
               },
               "password": password
             });
+        }
+
+        createFilter(userId, filter) {
+            return this._post(`/user/${encodeURIComponent(userId)}/filter`, undefined, filter);
         }
     }
 
@@ -168,7 +177,7 @@ var main = (function () {
     }, {}));
 
     class StorageError extends Error {
-        constructor(message, cause) {
+        constructor(message, cause, value) {
             let fullMessage = message;
             if (cause) {
                 fullMessage += ": ";
@@ -181,6 +190,8 @@ var main = (function () {
             if (cause) {
                 this.errcode = cause.name;
             }
+            this.cause = cause;
+            this.value = value;
         }
     }
 
@@ -506,12 +517,22 @@ var main = (function () {
             return new QueryTarget(new QueryTargetWrapper(this._idbStore.index(indexName)));
         }
 
-        put(value) {
-            return reqAsPromise(this._idbStore.put(value));
+        async put(value) {
+            try {
+                return await reqAsPromise(this._idbStore.put(value));
+            } catch(err) {
+                const originalErr = err.cause;
+                throw new StorageError(`put on ${this._idbStore.name} failed`, originalErr, value);
+            }
         }
 
-        add(value) {
-            return reqAsPromise(this._idbStore.add(value));
+        async add(value) {
+            try {
+                return await reqAsPromise(this._idbStore.add(value));
+            } catch(err) {
+                const originalErr = err.cause;
+                throw new StorageError(`add on ${this._idbStore.name} failed`, originalErr, value);
+            }
         }
 
         delete(keyOrKeyRange) {
@@ -1125,9 +1146,18 @@ var main = (function () {
         }
     }
 
-    async function createIdbStorage(databaseName) {
-        const db = await openDatabase(databaseName, createStores, 1);
-        return new Storage(db);
+    class StorageFactory {
+        async create(sessionId) {
+            const databaseName = `brawl_session_${sessionId}`;
+            const db = await openDatabase(databaseName, createStores, 1);
+            return new Storage(db);
+        }
+
+        delete(sessionId) {
+            const databaseName = `brawl_session_${sessionId}`;
+            const req = window.indexedDB.deleteDatabase(databaseName);
+            return reqAsPromise(req);
+        }
     }
 
     function createStores(db) {
@@ -1198,6 +1228,13 @@ var main = (function () {
             sessions.push(sessionInfo);
             localStorage.setItem(this._name, JSON.stringify(sessions));
         }
+
+        async delete(sessionId) {
+            let sessions = await this.getAll();
+            sessions = sessions.filter(s => s.id !== sessionId);
+            localStorage.setItem(this._name, JSON.stringify(sessions));
+        }
+        
     }
 
     class EventEmitter {
@@ -1646,6 +1683,20 @@ var main = (function () {
         }
     }
 
+    // Synapse bug? where the m.room.create event appears twice in sync response
+    // when first syncing the room
+    function deduplicateEvents(events) {
+        const eventIds = new Set();
+        return events.filter(e => {
+            if (eventIds.has(e.event_id)) {
+                return false;
+            } else {
+                eventIds.add(e.event_id);
+                return true;
+            }
+        });
+    }
+
     class SyncWriter {
         constructor({roomId, storage, fragmentIdComparer}) {
             this._roomId = roomId;
@@ -1732,7 +1783,8 @@ var main = (function () {
             }
             let currentKey = this._lastLiveKey;
             if (timeline.events) {
-                for(const event of timeline.events) {
+                const events = deduplicateEvents(timeline.events);
+                for(const event of events) {
                     currentKey = currentKey.nextKey();
                     const entry = createEventEntry(currentKey, this._roomId, event);
                     txn.timelineEvents.insert(entry);
@@ -2701,7 +2753,8 @@ var main = (function () {
             const response = await this._hsApi.messages(this._roomId, {
                 from: fragmentEntry.token,
                 dir: fragmentEntry.direction.asApiString(),
-                limit: amount
+                limit: amount,
+                filter: {lazy_load_members: true}
             }).response();
             const gapWriter = new GapWriter({
                 roomId: this._roomId,
@@ -3334,15 +3387,20 @@ var main = (function () {
             return room;
         }
 
-        persistSync(syncToken, accountData, txn) {
+        persistSync(syncToken, syncFilterId, accountData, txn) {
             if (syncToken !== this._session.syncToken) {
                 this._session.syncToken = syncToken;
+                this._session.syncFilterId = syncFilterId;
                 txn.session.set(this._session);
             }
         }
 
         get syncToken() {
             return this._session.syncToken;
+        }
+
+        get syncFilterId() {
+            return this._session.syncFilterId;
         }
 
         get user() {
@@ -3406,7 +3464,8 @@ var main = (function () {
                 } catch (err) {
                     this._isSyncing = false;
                     if (!(err instanceof RequestAbortError)) {
-                        console.error("stopping sync because of error", err.stack);
+                        console.error("stopping sync because of error");
+                        console.error(err);
                         this.emit("status", "error", err);
                     }
                 }
@@ -3415,7 +3474,11 @@ var main = (function () {
         }
 
         async _syncRequest(syncToken, timeout) {
-            this._currentRequest = this._hsApi.sync(syncToken, undefined, timeout);
+            let {syncFilterId} = this._session;
+            if (typeof syncFilterId !== "string") {
+                syncFilterId = (await this._hsApi.createFilter(this._session.user.id, {room: {state: {lazy_load_members: true}}}).response()).filter_id;
+            }
+            this._currentRequest = this._hsApi.sync(syncToken, syncFilterId, timeout);
             const response = await this._currentRequest.response();
             syncToken = response.next_batch;
             const storeNames = this._storage.storeNames;
@@ -3429,7 +3492,7 @@ var main = (function () {
             ]);
             const roomChanges = [];
             try {
-                this._session.persistSync(syncToken, response.account_data, syncTxn);
+                this._session.persistSync(syncToken, syncFilterId, response.account_data,  syncTxn);
                 // to_device
                 // presence
                 if (response.rooms) {
@@ -3456,7 +3519,7 @@ var main = (function () {
                 await syncTxn.complete();
                 console.info("syncTxn committed!!");
             } catch (err) {
-                console.error("unable to commit sync tranaction", err.message);
+                console.error("unable to commit sync tranaction");
                 throw err;
             }
             // emit room related events after txn has been closed
@@ -4270,23 +4333,76 @@ var main = (function () {
         }
     }
 
+    class SessionItemViewModel extends EventEmitter {
+        constructor(sessionInfo, pickerVM) {
+            super();
+            this._pickerVM = pickerVM;
+            this._sessionInfo = sessionInfo;
+            this._isDeleting = false;
+            this._error = null;
+        }
+
+        get error() {
+            return this._error && this._error.message;
+        }
+
+        async delete() {
+            this._isDeleting = true;
+            this.emit("change", "isDeleting");
+            try {
+                await this._pickerVM.delete(this.id);
+            } catch(err) {
+                this._error = err;
+                console.error(err);
+                this.emit("change", "error");
+            } finally {
+                this._isDeleting = false;
+                this.emit("change", "isDeleting");
+            }
+        }
+
+        get isDeleting() {
+            return this._isDeleting;
+        }
+
+        get id() {
+            return this._sessionInfo.id;
+        }
+
+        get userId() {
+            return this._sessionInfo.userId;
+        }
+
+        get sessionInfo() {
+            return this._sessionInfo;
+        }
+    }
+
     class SessionPickerViewModel {
-        constructor({sessionStore, sessionCallback}) {
+        constructor({storageFactory, sessionStore, sessionCallback}) {
+            this._storageFactory = storageFactory;
             this._sessionStore = sessionStore;
             this._sessionCallback = sessionCallback;
-            this._sessions = new SortedArray((s1, s2) => (s1.lastUsed || 0) - (s2.lastUsed || 0));
+            this._sessions = new SortedArray((s1, s2) => (s1.sessionInfo.lastUsed || 0) - (s2.sessionInfo.lastUsed || 0));
         }
 
         async load() {
             const sessions = await this._sessionStore.getAll();
-            this._sessions.setManyUnsorted(sessions);
+            this._sessions.setManyUnsorted(sessions.map(s => new SessionItemViewModel(s, this)));
         }
 
         pick(id) {
-            const session = this._sessions.array.find(s => s.id === id);
-            if (session) {
-                this._sessionCallback(session);
+            const sessionVM = this._sessions.array.find(s => s.id === id);
+            if (sessionVM) {
+                this._sessionCallback(sessionVM.sessionInfo);
             }
+        }
+
+        async delete(id) {
+            const idx = this._sessions.array.findIndex(s => s.id === id);
+            await this._sessionStore.delete(id);
+            await this._storageFactory.delete(id);
+            this._sessions.remove(idx);
         }
 
         get sessions() {
@@ -4299,9 +4415,9 @@ var main = (function () {
     }
 
     class BrawlViewModel extends EventEmitter {
-        constructor({createStorage, sessionStore, createHsApi, clock}) {
+        constructor({storageFactory, sessionStore, createHsApi, clock}) {
             super();
-            this._createStorage = createStorage;
+            this._storageFactory = storageFactory;
             this._sessionStore = sessionStore;
             this._createHsApi = createHsApi;
             this._clock = clock;
@@ -4325,6 +4441,7 @@ var main = (function () {
             this._clearSections();
             this._sessionPickerViewModel = new SessionPickerViewModel({
                 sessionStore: this._sessionStore,
+                storageFactory: this._storageFactory,
                 sessionCallback: sessionInfo => this._onSessionPicked(sessionInfo)
             });
             this.emit("change", "activeSection");
@@ -4415,7 +4532,7 @@ var main = (function () {
                 this._loading = true;
                 this._loadingText = "Loading your conversations…";
                 const hsApi = this._createHsApi(sessionInfo.homeServer, sessionInfo.accessToken);
-                const storage = await this._createStorage(sessionInfo.id);
+                const storage = await this._storageFactory.create(sessionInfo.id);
                 // no need to pass access token to session
                 const filteredSessionInfo = {
                     deviceId: sessionInfo.deviceId,
@@ -4915,7 +5032,9 @@ var main = (function () {
         }
 
         update(value, prop) {
-            this._template.update(value);
+            if (this._template) {
+                this._template.update(value);
+            }
         }
     }
 
@@ -5264,8 +5383,25 @@ var main = (function () {
     }
 
     class SessionPickerItem extends TemplateView {
+        constructor(vm) {
+            super(vm, true);
+            this._onDeleteClick = this._onDeleteClick.bind(this);
+        }
+
+        _onDeleteClick(event) {
+            event.stopPropagation();
+            event.preventDefault();
+            this.viewModel.delete();
+        }
+
         render(t) {
-            return t.li([vm => vm.userId]);
+            const deleteButton = t.button({
+                disabled: vm => vm.isDeleting,
+                onClick: event => this._onDeleteClick(event)
+            }, "Delete");
+            const userName = t.span({className: "userId"}, vm => vm.userId);
+            const errorMessage = t.if(vm => vm.error, t => t.span({className: "error"}, vm => vm.error));
+            return t.li([userName, errorMessage, deleteButton]);
         }
     }
 
@@ -5358,7 +5494,7 @@ var main = (function () {
     async function main(container) {
         try {
             const vm = new BrawlViewModel({
-                createStorage: sessionId => createIdbStorage(`brawl_session_${sessionId}`),
+                storageFactory: new StorageFactory(),
                 createHsApi: (homeServer, accessToken = null) => new HomeServerApi(homeServer, accessToken),
                 sessionStore: new SessionsStore("brawl_sessions_v1"),
                 clock: Date //just for `now` fn
