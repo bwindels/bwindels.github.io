@@ -1293,10 +1293,25 @@ var main = (function () {
     		this._inviteCount = 0;
     		this._joinCount = 0;
     		this._readMarkerEventId = null;
+            this._heroes = null;
+            this._canonicalAlias = null;
+            this._aliases = null;
     	}
 
     	get name() {
-    		return this._name || this._roomId;
+    		if (this._name) {
+                return this._name;
+            }
+            if (this._canonicalAlias) {
+                return this._canonicalAlias;
+            }
+            if (this._aliases) {
+                return this._aliases[0];
+            }
+            if (this._heroes) {
+                return this._heroes.join(", ");
+            }
+            return this._roomId;
     	}
 
     	get lastMessage() {
@@ -1331,6 +1346,9 @@ var main = (function () {
     		this._inviteCount = summary.inviteCount;
     		this._joinCount = summary.joinCount;
     		this._readMarkerEventId = summary.readMarkerEventId;
+            this._heroes = summary.heroes;
+            this._aliases = summary.aliases;
+            this._canonicalAlias = summary.canonicalAlias;
     	}
 
     	_persist(txn) {
@@ -1352,16 +1370,19 @@ var main = (function () {
     			inviteCount: this._inviteCount,
     			joinCount: this._joinCount,
     			readMarkerEventId: this._readMarkerEventId,
+                heroes: this._heroes,
+                aliases: this._aliases,
+                canonicalAlias: this._canonicalAlias,
     		};
     		return txn.roomSummary.set(summary);
     	}
 
     	_processSyncResponse(roomResponse, membership) {
-    		// lets not do lazy loading for now
-    		// if (roomResponse.summary) {
-    		// 	this._updateSummary(roomResponse.summary);
-    		// }
     		let changed = false;
+    		if (roomResponse.summary) {
+                this._updateSummary(roomResponse.summary);
+                changed = true;
+    		}
     		if (membership !== this._membership) {
     			this._membership = membership;
     			changed = true;
@@ -1404,7 +1425,15 @@ var main = (function () {
     				this._lastMessageBody = body;
     				return true;
     			}
-    		}
+    		} else if (event.type === "m.room.canonical_alias") {
+                const content = event.content;
+                this._canonicalAlias = content.alias;
+                return true;
+            } else if (event.type === "m.room.aliases") {
+                const content = event.content;
+                this._aliases = content.aliases;
+                return true;
+            }
     		return false;
     	}
 
@@ -1451,7 +1480,6 @@ var main = (function () {
     		if (Number.isInteger(joinCount)) {
     			this._joinCount = joinCount;
     		}
-    		// this._recaculateNameIfNoneSet();
     	}
     }
 
@@ -4339,6 +4367,7 @@ var main = (function () {
             this._pickerVM = pickerVM;
             this._sessionInfo = sessionInfo;
             this._isDeleting = false;
+            this._isClearing = false;
             this._error = null;
         }
 
@@ -4361,8 +4390,27 @@ var main = (function () {
             }
         }
 
+        async clear() {
+            this._isClearing = true;
+            this.emit("change", "isClearing");
+            try {
+                await this._pickerVM.clear(this.id);
+            } catch(err) {
+                this._error = err;
+                console.error(err);
+                this.emit("change", "error");
+            } finally {
+                this._isClearing = false;
+                this.emit("change", "isClearing");
+            }
+        }
+
         get isDeleting() {
             return this._isDeleting;
+        }
+
+        get isClearing() {
+            return this._isClearing;
         }
 
         get id() {
@@ -4403,6 +4451,10 @@ var main = (function () {
             await this._sessionStore.delete(id);
             await this._storageFactory.delete(id);
             this._sessions.remove(idx);
+        }
+
+        async clear(id) {
+            await this._storageFactory.delete(id);
         }
 
         get sessions() {
@@ -5386,22 +5438,35 @@ var main = (function () {
         constructor(vm) {
             super(vm, true);
             this._onDeleteClick = this._onDeleteClick.bind(this);
+            this._onClearClick = this._onClearClick.bind(this);
         }
 
         _onDeleteClick(event) {
             event.stopPropagation();
             event.preventDefault();
-            this.viewModel.delete();
+            if (confirm("Are you sure?")) {
+                this.viewModel.delete();
+            }
+        }
+
+        _onClearClick(event) {
+            event.stopPropagation();
+            event.preventDefault();
+            this.viewModel.clear();
         }
 
         render(t) {
             const deleteButton = t.button({
                 disabled: vm => vm.isDeleting,
-                onClick: event => this._onDeleteClick(event)
+                onClick: this._onDeleteClick,
             }, "Delete");
+            const clearButton = t.button({
+                disabled: vm => vm.isClearing,
+                onClick: this._onClearClick,
+            }, "Clear");
             const userName = t.span({className: "userId"}, vm => vm.userId);
             const errorMessage = t.if(vm => vm.error, t => t.span({className: "error"}, vm => vm.error));
-            return t.li([userName, errorMessage, deleteButton]);
+            return t.li([userName, errorMessage, clearButton, deleteButton]);
         }
     }
 
