@@ -4369,6 +4369,7 @@ var main = (function () {
             this._isDeleting = false;
             this._isClearing = false;
             this._error = null;
+            this._showJSON = false;
         }
 
         get error() {
@@ -4392,8 +4393,8 @@ var main = (function () {
 
         async clear() {
             this._isClearing = true;
-            alert(JSON.stringify(this._sessionInfo, undefined, 2));
-            this.emit("change", "isClearing");
+            this._showJSON = true;
+            this.emit("change");
             try {
                 await this._pickerVM.clear(this.id);
             } catch(err) {
@@ -4424,6 +4425,13 @@ var main = (function () {
 
         get sessionInfo() {
             return this._sessionInfo;
+        }
+
+        get json() {
+            if (this._showJSON) {
+                return JSON.stringify(this._sessionInfo, undefined, 2);
+            }
+            return null;
         }
     }
 
@@ -5474,9 +5482,14 @@ var main = (function () {
                 disabled: vm => vm.isClearing,
                 onClick: this._onClearClick,
             }, "Clear");
+
+            const json = t.if(vm => vm.json, t => {
+                return t.div(t.pre(vm => vm.json));
+            });
+
             const userName = t.span({className: "userId"}, vm => vm.userId);
             const errorMessage = t.if(vm => vm.error, t => t.span({className: "error"}, vm => vm.error));
-            return t.li([userName, errorMessage, clearButton, deleteButton]);
+            return t.li([t.div({className: "sessionInfo"}, [userName, errorMessage, clearButton, deleteButton]), json]);
         }
     }
 
@@ -5484,8 +5497,10 @@ var main = (function () {
         mount() {
             this._sessionList = new ListView({
                 list: this.viewModel.sessions,
-                onItemClick: (item) => {
-                    this.viewModel.pick(item.viewModel.id);
+                onItemClick: (item, event) => {
+                    if (event.target.closest(".sessionInfo")) {
+                        this.viewModel.pick(item.viewModel.id);
+                    }
                 },
             }, sessionInfo => {
                 return new SessionPickerItem(sessionInfo);
