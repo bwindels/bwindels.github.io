@@ -4392,6 +4392,7 @@ var main = (function () {
 
         async clear() {
             this._isClearing = true;
+            alert(JSON.stringify(this._sessionInfo, undefined, 2));
             this.emit("change", "isClearing");
             try {
                 await this._pickerVM.clear(this.id);
@@ -4431,7 +4432,7 @@ var main = (function () {
             this._storageFactory = storageFactory;
             this._sessionStore = sessionStore;
             this._sessionCallback = sessionCallback;
-            this._sessions = new SortedArray((s1, s2) => (s1.sessionInfo.lastUsed || 0) - (s2.sessionInfo.lastUsed || 0));
+            this._sessions = new SortedArray((s1, s2) => s1.id.localeCompare(s2.id));
         }
 
         async load() {
@@ -4444,6 +4445,15 @@ var main = (function () {
             if (sessionVM) {
                 this._sessionCallback(sessionVM.sessionInfo);
             }
+        }
+
+        async import(json) {
+            const sessionInfo = JSON.parse(json);
+            const sessionId = (Math.floor(Math.random() * Number.MAX_SAFE_INTEGER)).toString();
+            sessionInfo.id = sessionId;
+            sessionInfo.lastUsed = sessionId;
+            await this._sessionStore.add(sessionInfo);
+            this._sessions.set(new SessionItemViewModel(sessionInfo, this));
         }
 
         async delete(id) {
@@ -5487,7 +5497,8 @@ var main = (function () {
             return t.div({className: "SessionPickerView"}, [
                 t.h1(["Pick a session"]),
                 this._sessionList.mount(),
-                t.button({onClick: () => this.viewModel.cancel()}, ["Log in to a new session instead"])
+                t.p(t.button({onClick: () => this.viewModel.cancel()}, ["Log in to a new session instead"])),
+                t.p(t.button({onClick: () => this.viewModel.import(prompt("JSON"))}, ["Import Session JSON"]))
             ]);
         }
 
