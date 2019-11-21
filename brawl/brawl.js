@@ -229,7 +229,7 @@ var main = (function () {
     function txnAsPromise(txn) {
         return new Promise((resolve, reject) => {
             txn.addEventListener("complete", resolve);
-            txn.addEventListener("abort", e => reject(wrapError(e)));
+            txn.addEventListener("abort", event => reject(wrapError(event.target.error)));
         });
     }
 
@@ -5452,7 +5452,7 @@ var main = (function () {
         }
     }
 
-    class SessionPickerItem extends TemplateView {
+    class SessionPickerItemView extends TemplateView {
         constructor(vm) {
             super(vm, true);
             this._onDeleteClick = this._onDeleteClick.bind(this);
@@ -5503,7 +5503,7 @@ var main = (function () {
                     }
                 },
             }, sessionInfo => {
-                return new SessionPickerItem(sessionInfo);
+                return new SessionPickerItemView(sessionInfo);
             });
             return super.mount();
         }
