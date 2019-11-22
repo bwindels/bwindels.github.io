@@ -1,0 +1,9 @@
+CACHE MANIFEST
+# v0.0.10
+NETWORK
+"*"
+CACHE
+brawl.js
+brawl.css
+index.html
+icon-192.png

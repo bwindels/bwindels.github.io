@@ -1,0 +1,44 @@
+<!DOCTYPE html><html manifest="manifest.appcache"><head>
+		<meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, user-scalable=no">
+        <meta name="application-name" content="Brawl Chat">
+        <meta name="apple-mobile-web-app-capable" content="yes">
+        <meta name="apple-mobile-web-app-status-bar-style" content="black">
+        <meta name="apple-mobile-web-app-title" content="Brawl Chat">
+        <meta name="description" content="A matrix chat application">
+        <link rel="stylesheet" type="text/css" href="brawl.css">
+	<link rel="manifest" href="manifest.json"></head>
+	<body>
+        <script id="phone-debug-pre" type="text/javascript">
+            window.DEBUG = true;
+            window.debugConsoleBuffer = "";
+            console.error = (...params) => {
+                const lastLines = "...\n" + window.debugConsoleBuffer.split("\n").slice(-10).join("\n");
+                // window.debugConsoleBuffer = window.debugConsoleBuffer + "ERR " + params.join(" ") + "\n";
+                // const location = new Error().stack.split("\n")[2];
+                alert(params.join(" ") +"\n...\n" + lastLines);
+            };
+            console.log = console.info = console.warn = (...params) => {
+                window.debugConsoleBuffer = window.debugConsoleBuffer + params.join(" ") + "\n";
+            };
+        </script>
+		<script type="text/javascript" src="brawl.js"></script><script type="text/javascript">main(document.body);</script>
+        <script id="phone-debug-post" type="text/javascript">
+            setTimeout(() => {
+                const showlogs = document.getElementById("showlogs");
+                showlogs.addEventListener("click", () => {
+                    const lastLines = "...\n" + window.debugConsoleBuffer.split("\n").slice(-20).join("\n");
+                    alert(lastLines);
+                }, true);
+                showlogs.innerText = "Show last 20 log lines";
+            }, 5000);
+        </script>
+        <script id="service-worker" type="text/javascript">
+            if('serviceWorker' in navigator) {
+                navigator.serviceWorker.register('sw.js')
+                    .then(function() { console.log("Service Worker registered"); });
+            }
+        </script>        
+	
+
+</body></html>
