@@ -4710,7 +4710,7 @@ var main = (function () {
     }
 
     const TAG_NAMES = [
-        "ol", "ul", "li", "div", "h1", "h2", "h3", "h4", "h5", "h6",
+        "a", "ol", "ul", "li", "div", "h1", "h2", "h3", "h4", "h5", "h6",
         "p", "strong", "em", "span", "img", "section", "main", "article", "aside",
         "pre", "button", "time", "input", "textarea"];
 
@@ -5450,7 +5450,8 @@ var main = (function () {
                     onClick: () => vm.login(username.value, password.value, homeserver.value),
                     disabled: vm => vm.loading
                 }, "Log In")),
-                t.div(t.button({onClick: () => vm.cancel()}, ["Pick an existing session"]))
+                t.div(t.button({onClick: () => vm.cancel()}, ["Pick an existing session"])),
+                t.p(t.a({href: "https://github.com/bwindels/brawl-chat"}, ["Brawl on Github"]))
             ]);
         }
     }
@@ -5516,7 +5517,8 @@ var main = (function () {
                 t.h1(["Pick a session"]),
                 this._sessionList.mount(),
                 t.p(t.button({onClick: () => this.viewModel.cancel()}, ["Log in to a new session instead"])),
-                t.p(t.button({onClick: () => this.viewModel.import(prompt("JSON"))}, ["Import Session JSON"]))
+                t.p(t.button({onClick: () => this.viewModel.import(prompt("JSON"))}, ["Import Session JSON"])),
+                t.p(t.a({href: "https://github.com/bwindels/brawl-chat"}, ["Brawl on Github"]))
             ]);
         }
 
