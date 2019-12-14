@@ -1149,17 +1149,55 @@ var main = (function () {
         }
     }
 
+    async function exportSession(db) {
+        const NOT_DONE = {done: false};
+        const txn = db.transaction(STORE_NAMES, "readonly");
+        const data = {};
+        await Promise.all(STORE_NAMES.map(async name => {
+            const results = data[name] = [];  // initialize in deterministic order
+            const store = txn.objectStore(name);
+            await iterateCursor(store.openCursor(), (value) => {
+                results.push(value);
+                return NOT_DONE;
+            });
+        }));
+        return data;
+    }
+
+    async function importSession(db, data) {
+        const txn = db.transaction(STORE_NAMES, "readwrite");
+        for (const name of STORE_NAMES) {
+            const store = txn.objectStore(name);
+            for (const value of data[name]) {
+                store.add(value);
+            }
+        }
+        await txnAsPromise(txn);
+    }
+
+    const sessionName = sessionId => `brawl_session_${sessionId}`;
+    const openDatabaseWithSessionId = sessionId => openDatabase(sessionName(sessionId), createStores, 1);
+
     class StorageFactory {
         async create(sessionId) {
-            const databaseName = `brawl_session_${sessionId}`;
-            const db = await openDatabase(databaseName, createStores, 1);
+            const db = await openDatabaseWithSessionId(sessionId);
             return new Storage(db);
         }
 
         delete(sessionId) {
-            const databaseName = `brawl_session_${sessionId}`;
+            const databaseName = sessionName(sessionId);
             const req = window.indexedDB.deleteDatabase(databaseName);
             return reqAsPromise(req);
+        }
+
+        async export(sessionId) {
+            const db = await openDatabaseWithSessionId(sessionId);
+            return await exportSession(db);
+        }
+
+        async import(sessionId, data) {
+            const db = await openDatabaseWithSessionId(sessionId);
+            return await importSession(db, data);
         }
     }
 
@@ -4372,7 +4410,7 @@ var main = (function () {
             this._isDeleting = false;
             this._isClearing = false;
             this._error = null;
-            this._showJSON = false;
+            this._exportDataUrl = null;
         }
 
         get error() {
@@ -4396,7 +4434,6 @@ var main = (function () {
 
         async clear() {
             this._isClearing = true;
-            this._showJSON = true;
             this.emit("change");
             try {
                 await this._pickerVM.clear(this.id);
@@ -4422,19 +4459,42 @@ var main = (function () {
             return this._sessionInfo.id;
         }
 
-        get userId() {
-            return this._sessionInfo.userId;
+        get label() {
+            const {userId, comment} =  this._sessionInfo;
+            if (comment) {
+                return `${userId} (${comment})`;
+            } else {
+                return userId;
+            }
         }
 
         get sessionInfo() {
             return this._sessionInfo;
         }
 
-        get json() {
-            if (this._showJSON) {
-                return JSON.stringify(this._sessionInfo);
+        get exportDataUrl() {
+            return this._exportDataUrl;
+        }
+
+        async export() {
+            try {
+                const data = await this._pickerVM._exportData(this._sessionInfo.id);
+                const json = JSON.stringify(data, undefined, 2);
+                const blob = new Blob([json], {type: "application/json"});
+                this._exportDataUrl = URL.createObjectURL(blob);
+                this.emit("change", "exportDataUrl");
+            } catch (err) {
+                alert(err.message);
+                console.error(err);
             }
-            return null;
+        }
+
+        clearExport() {
+            if (this._exportDataUrl) {
+                URL.revokeObjectURL(this._exportDataUrl);
+                this._exportDataUrl = null;
+                this.emit("change", "exportDataUrl");
+            }
         }
     }
 
@@ -4458,11 +4518,19 @@ var main = (function () {
             }
         }
 
+        async _exportData(id) {
+            const sessionInfo = await this._sessionStore.get(id);
+            const stores = await this._storageFactory.export(id);
+            const data = {sessionInfo, stores};
+            return data;
+        }
+
         async import(json) {
-            const sessionInfo = JSON.parse(json);
-            const sessionId = (Math.floor(Math.random() * Number.MAX_SAFE_INTEGER)).toString();
-            sessionInfo.id = sessionId;
-            sessionInfo.lastUsed = sessionId;
+            const data = JSON.parse(json);
+            const {sessionInfo} = data;
+            sessionInfo.comment = `Imported on ${new Date().toLocaleString()} from id ${sessionInfo.id}.`;
+            sessionInfo.id = createNewSessionId();
+            await this._storageFactory.import(sessionInfo.id, data.stores);
             await this._sessionStore.add(sessionInfo);
             this._sessions.set(new SessionItemViewModel(sessionInfo, this));
         }
@@ -4485,6 +4553,10 @@ var main = (function () {
         cancel() {
             this._sessionCallback();
         }
+    }
+
+    function createNewSessionId() {
+        return (Math.floor(Math.random() * Number.MAX_SAFE_INTEGER)).toString();
     }
 
     class BrawlViewModel extends EventEmitter {
@@ -4575,7 +4647,7 @@ var main = (function () {
         async _onLoginFinished(loginData) {
             if (loginData) {
                 // TODO: extract random() as it is a source of non-determinism
-                const sessionId = (Math.floor(Math.random() * Number.MAX_SAFE_INTEGER)).toString();
+                const sessionId = createNewSessionId();
                 const sessionInfo = {
                     id: sessionId,
                     deviceId: loginData.device_id,
@@ -5456,44 +5528,72 @@ var main = (function () {
         }
     }
 
+    function selectFileAsText(mimeType) {
+        const input = document.createElement("input");
+        input.setAttribute("type", "file");
+        if (mimeType) {
+            input.setAttribute("accept", mimeType);
+        }
+        const promise = new Promise((resolve, reject) => {
+            const checkFile = () => {
+                input.removeEventListener("change", checkFile, true);
+                const file = input.files[0];
+                if (file) {
+                    resolve(file.text());
+                } else {
+                    reject(new Error("No file selected"));
+                }
+            };
+            input.addEventListener("change", checkFile, true);
+        });
+        input.click();
+        return promise;
+    }
+
+
+
     class SessionPickerItemView extends TemplateView {
         constructor(vm) {
             super(vm, true);
-            this._onDeleteClick = this._onDeleteClick.bind(this);
-            this._onClearClick = this._onClearClick.bind(this);
         }
 
-        _onDeleteClick(event) {
-            event.stopPropagation();
-            event.preventDefault();
+        _onDeleteClick() {
             if (confirm("Are you sure?")) {
                 this.viewModel.delete();
             }
         }
 
-        _onClearClick(event) {
-            event.stopPropagation();
-            event.preventDefault();
-            this.viewModel.clear();
-        }
-
         render(t) {
             const deleteButton = t.button({
                 disabled: vm => vm.isDeleting,
-                onClick: this._onDeleteClick,
+                onClick: this._onDeleteClick.bind(this),
             }, "Delete");
             const clearButton = t.button({
                 disabled: vm => vm.isClearing,
-                onClick: this._onClearClick,
+                onClick: () => this.viewModel.clear(),
             }, "Clear");
-
-            const json = t.if(vm => vm.json, t => {
-                return t.div(t.pre(vm => vm.json));
+            const exportButton = t.button({
+                disabled: vm => vm.isClearing,
+                onClick: () => this.viewModel.export(),
+            }, "Export");
+            const downloadExport = t.if(vm => vm.exportDataUrl, (t, vm) => {
+                return t.a({
+                    href: vm.exportDataUrl,
+                    download: `brawl-session-${this.viewModel.id}.json`,
+                    onClick: () => setTimeout(() => this.viewModel.clearExport(), 100),
+                }, "Download");
             });
 
-            const userName = t.span({className: "userId"}, vm => vm.userId);
+            const userName = t.span({className: "userId"}, vm => vm.label);
             const errorMessage = t.if(vm => vm.error, t => t.span({className: "error"}, vm => vm.error));
-            return t.li([t.div({className: "sessionInfo"}, [userName, errorMessage, clearButton, deleteButton]), json]);
+            return t.li([t.div({className: "sessionInfo"}, [
+                userName,
+                errorMessage,
+                downloadExport,
+                exportButton,
+                clearButton,
+                deleteButton,
+            ])]);
         }
     }
 
@@ -5502,7 +5602,7 @@ var main = (function () {
             this._sessionList = new ListView({
                 list: this.viewModel.sessions,
                 onItemClick: (item, event) => {
-                    if (event.target.closest(".sessionInfo")) {
+                    if (event.target.closest(".userId")) {
                         this.viewModel.pick(item.viewModel.id);
                     }
                 },
@@ -5517,7 +5617,7 @@ var main = (function () {
                 t.h1(["Pick a session"]),
                 this._sessionList.mount(),
                 t.p(t.button({onClick: () => this.viewModel.cancel()}, ["Log in to a new session instead"])),
-                t.p(t.button({onClick: () => this.viewModel.import(prompt("JSON"))}, ["Import Session JSON"])),
+                t.p(t.button({onClick: async () => this.viewModel.import(await selectFileAsText("application/json"))}, "Import")),
                 t.p(t.a({href: "https://github.com/bwindels/brawl-chat"}, ["Brawl on Github"]))
             ]);
         }
