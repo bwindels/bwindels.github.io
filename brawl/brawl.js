@@ -22,26 +22,23 @@ var main = (function () {
     }
 
     class RequestWrapper {
-        constructor(promise, controller) {
-            if (!controller) {
-                const abortPromise = new Promise((_, reject) => {
-                    this._controller = {
-                        abort() {
-                            const err = new Error("fetch request aborted");
-                            err.name = "AbortError";
-                            reject(err);
-                        }
-                    };
-                });
-                this._promise = Promise.race([promise, abortPromise]);
-            } else {
-                this._promise = promise;
-                this._controller = controller;
-            }
+        constructor(method, url, requestResult) {
+            this._requestResult = requestResult;
+            this._promise = this._requestResult.response().then(response => {
+                // ok?
+                if (response.status >= 200 && response.status < 300) {
+                    return response.body;
+                } else {
+                    switch (response.status) {
+                        default:
+                            throw new HomeServerError(method, url, response.body);
+                    }
+                }
+            });
         }
 
         abort() {
-            this._controller.abort();
+            return this._requestResult.abort();
         }
 
         response() {
@@ -49,13 +46,13 @@ var main = (function () {
         }
     }
 
-    // todo: everywhere here, encode params in the url that could have slashes ... mainly event ids?
     class HomeServerApi {
-        constructor(homeserver, accessToken) {
+        constructor({homeServer, accessToken, request}) {
             // store these both in a closure somehow so it's harder to get at in case of XSS?
             // one could change the homeserver as well so the token gets sent there, so both must be protected from read/write
-            this._homeserver = homeserver;
+            this._homeserver = homeServer;
             this._accessToken = accessToken;
+            this._requestFn = request;
         }
 
         _url(csPath) {
@@ -83,42 +80,12 @@ var main = (function () {
                 headers.append("Content-Type", "application/json");
                 bodyString = JSON.stringify(body);
             }
-            const controller = typeof AbortController === "function" ? new AbortController() : null;
-            // TODO: set authenticated headers with second arguments, cache them
-            let promise = fetch(url, {
+            const requestResult = this._requestFn(url, {
                 method,
                 headers,
                 body: bodyString,
-                signal: controller && controller.signal,
-                mode: "cors",
-                credentials: "omit",
-                referrer: "no-referrer",
-                cache: "no-cache",
             });
-            promise = promise.then(async (response) => {
-                if (response.ok) {
-                    return await response.json();
-                } else {
-                    switch (response.status) {
-                        default:
-                            throw new HomeServerError(method, url, await response.json())
-                    }
-                }
-            }, err => {
-                if (err.name === "AbortError") {
-                    throw new RequestAbortError();
-                } else if (err instanceof TypeError) {
-                    // Network errors are reported as TypeErrors, see
-                    // https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch#Checking_that_the_fetch_was_successful
-                    // this can either mean user is offline, server is offline, or a CORS error (server misconfiguration).
-                    // 
-                    // One could check navigator.onLine to rule out the first
-                    // but the 2 later ones are indistinguishable from javascript.
-                    throw new NetworkError(`${method} ${url}: ${err.message}`);
-                }
-                throw err;
-            });
-            return new RequestWrapper(promise, controller);
+            return new RequestWrapper(method, url, requestResult);
         }
 
         _post(csPath, queryParams, body) {
@@ -160,6 +127,68 @@ var main = (function () {
         createFilter(userId, filter) {
             return this._post(`/user/${encodeURIComponent(userId)}/filter`, undefined, filter);
         }
+    }
+
+    class RequestResult {
+        constructor(promise, controller) {
+            if (!controller) {
+                const abortPromise = new Promise((_, reject) => {
+                    this._controller = {
+                        abort() {
+                            const err = new Error("fetch request aborted");
+                            err.name = "AbortError";
+                            reject(err);
+                        }
+                    };
+                });
+                this._promise = Promise.race([promise, abortPromise]);
+            } else {
+                this._promise = promise;
+                this._controller = controller;
+            }
+        }
+
+        abort() {
+            this._controller.abort();
+        }
+
+        response() {
+            return this._promise;
+        }
+    }
+
+    function fetchRequest(url, options) {
+        const controller = typeof AbortController === "function" ? new AbortController() : null;
+        if (controller) {
+            options = Object.assign(options, {
+                signal: controller.signal
+            });
+        }
+        options = Object.assign(options, {
+            mode: "cors",
+            credentials: "omit",
+            referrer: "no-referrer",
+            cache: "no-cache",
+        });
+        const promise = fetch(url, options).then(async response => {
+            const {status} = response;
+            const body = await response.json();
+            return {status, body};
+        }, err => {
+            if (err.name === "AbortError") {
+                throw new RequestAbortError();
+            } else if (err instanceof TypeError) {
+                // Network errors are reported as TypeErrors, see
+                // https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch#Checking_that_the_fetch_was_successful
+                // this can either mean user is offline, server is offline, or a CORS error (server misconfiguration).
+                // 
+                // One could check navigator.onLine to rule out the first
+                // but the 2 later ones are indistinguishable from javascript.
+                throw new NetworkError(`${options.method} ${url}: ${err.message}`);
+            }
+            throw err;
+        });
+        return new RequestResult(promise, controller);
     }
 
     const STORE_NAMES = Object.freeze([
@@ -1767,9 +1796,8 @@ var main = (function () {
     }
 
     class SyncWriter {
-        constructor({roomId, storage, fragmentIdComparer}) {
+        constructor({roomId, fragmentIdComparer}) {
             this._roomId = roomId;
-            this._storage = storage;
             this._fragmentIdComparer = fragmentIdComparer;
             this._lastLiveKey = null;
         }
@@ -1834,23 +1862,23 @@ var main = (function () {
         async writeSync(roomResponse, txn) {
             const entries = [];
             const timeline = roomResponse.timeline;
-            if (!this._lastLiveKey) {
+            let currentKey = this._lastLiveKey;
+            if (!currentKey) {
                 // means we haven't synced this room yet (just joined or did initial sync)
                 
                 // as this is probably a limited sync, prev_batch should be there
                 // (but don't fail if it isn't, we won't be able to back-paginate though)
                 let liveFragment = await this._createLiveFragment(txn, timeline.prev_batch);
-                this._lastLiveKey = new EventKey(liveFragment.id, EventKey.defaultLiveKey.eventIndex);
+                currentKey = new EventKey(liveFragment.id, EventKey.defaultLiveKey.eventIndex);
                 entries.push(FragmentBoundaryEntry.start(liveFragment, this._fragmentIdComparer));
             } else if (timeline.limited) {
                 // replace live fragment for limited sync, *only* if we had a live fragment already
-                const oldFragmentId = this._lastLiveKey.fragmentId;
-                this._lastLiveKey = this._lastLiveKey.nextFragmentKey();
-                const {oldFragment, newFragment} = await this._replaceLiveFragment(oldFragmentId, this._lastLiveKey.fragmentId, timeline.prev_batch, txn);
+                const oldFragmentId = currentKey.fragmentId;
+                currentKey = currentKey.nextFragmentKey();
+                const {oldFragment, newFragment} = await this._replaceLiveFragment(oldFragmentId, currentKey.fragmentId, timeline.prev_batch, txn);
                 entries.push(FragmentBoundaryEntry.end(oldFragment, this._fragmentIdComparer));
                 entries.push(FragmentBoundaryEntry.start(newFragment, this._fragmentIdComparer));
             }
-            let currentKey = this._lastLiveKey;
             if (timeline.events) {
                 const events = deduplicateEvents(timeline.events);
                 for(const event of events) {
@@ -1860,12 +1888,6 @@ var main = (function () {
                     entries.push(new EventEntry(entry, this._fragmentIdComparer));
                 }
             }
-            // right thing to do? if the txn fails, not sure we'll continue anyways ...
-            // only advance the key once the transaction has succeeded 
-            txn.complete().then(() => {
-                this._lastLiveKey = currentKey;
-            });
-
             // persist state
             const state = roomResponse.state;
             if (state.events) {
@@ -1882,7 +1904,11 @@ var main = (function () {
                 }
             }
 
-            return entries;
+            return {entries, newLiveKey: currentKey};
+        }
+
+        setKeyOnCompleted(newLiveKey) {
+            this._lastLiveKey = newLiveKey;
         }
     }
     //#endif
@@ -3184,7 +3210,7 @@ var main = (function () {
             this._hsApi = hsApi;
     		this._summary = new RoomSummary(roomId);
             this._fragmentIdComparer = new FragmentIdComparer([]);
-    		this._syncWriter = new SyncWriter({roomId, storage, fragmentIdComparer: this._fragmentIdComparer});
+    		this._syncWriter = new SyncWriter({roomId, fragmentIdComparer: this._fragmentIdComparer});
             this._emitCollectionChange = emitCollectionChange;
             this._sendQueue = new SendQueue({roomId, storage, sendScheduler, pendingEvents});
             this._timeline = null;
@@ -3193,19 +3219,20 @@ var main = (function () {
 
         async persistSync(roomResponse, membership, txn) {
     		const summaryChanged = this._summary.applySync(roomResponse, membership, txn);
-    		const newTimelineEntries = await this._syncWriter.writeSync(roomResponse, txn);
+    		const {entries, newLiveKey} = await this._syncWriter.writeSync(roomResponse, txn);
             let removedPendingEvents;
             if (roomResponse.timeline && roomResponse.timeline.events) {
                 removedPendingEvents = this._sendQueue.removeRemoteEchos(roomResponse.timeline.events, txn);
             }
-            return {summaryChanged, newTimelineEntries, removedPendingEvents};
+            return {summaryChanged, newTimelineEntries: entries, newLiveKey, removedPendingEvents};
         }
 
-        emitSync({summaryChanged, newTimelineEntries, removedPendingEvents}) {
+        emitSync({summaryChanged, newTimelineEntries, newLiveKey, removedPendingEvents}) {
             if (summaryChanged) {
                 this.emit("change");
                 this._emitCollectionChange(this);
             }
+            this._syncWriter.setKeyOnCompleted(newLiveKey);
             if (this._timeline) {
                 this._timeline.appendLiveEntries(newTimelineEntries);
             }
@@ -5689,9 +5716,21 @@ var main = (function () {
 
     async function main(container) {
         try {
+            // to replay:
+            // const fetchLog = await (await fetch("/fetchlogs/constrainterror.json")).json();
+            // const replay = new ReplayRequester(fetchLog, {delay: false});
+            // const request = replay.request;
+
+            // to record:
+            // const recorder = new RecordRequester(fetchRequest);
+            // const request = recorder.request;
+            // window.getBrawlFetchLog = () => recorder.log();
+
+            // normal network:
+            const request = fetchRequest;
             const vm = new BrawlViewModel({
                 storageFactory: new StorageFactory(),
-                createHsApi: (homeServer, accessToken = null) => new HomeServerApi(homeServer, accessToken),
+                createHsApi: (homeServer, accessToken = null) => new HomeServerApi({homeServer, accessToken, request}),
                 sessionStore: new SessionsStore("brawl_sessions_v1"),
                 clock: Date //just for `now` fn
             });

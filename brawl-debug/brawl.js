@@ -22,26 +22,23 @@ var main = (function () {
     }
 
     class RequestWrapper {
-        constructor(promise, controller) {
-            if (!controller) {
-                const abortPromise = new Promise((_, reject) => {
-                    this._controller = {
-                        abort() {
-                            const err = new Error("fetch request aborted");
-                            err.name = "AbortError";
-                            reject(err);
-                        }
-                    };
-                });
-                this._promise = Promise.race([promise, abortPromise]);
-            } else {
-                this._promise = promise;
-                this._controller = controller;
-            }
+        constructor(method, url, requestResult) {
+            this._requestResult = requestResult;
+            this._promise = this._requestResult.response().then(response => {
+                // ok?
+                if (response.status >= 200 && response.status < 300) {
+                    return response.body;
+                } else {
+                    switch (response.status) {
+                        default:
+                            throw new HomeServerError(method, url, response.body);
+                    }
+                }
+            });
         }
 
         abort() {
-            this._controller.abort();
+            return this._requestResult.abort();
         }
 
         response() {
@@ -49,13 +46,13 @@ var main = (function () {
         }
     }
 
-    // todo: everywhere here, encode params in the url that could have slashes ... mainly event ids?
     class HomeServerApi {
-        constructor(homeserver, accessToken) {
+        constructor({homeServer, accessToken, request}) {
             // store these both in a closure somehow so it's harder to get at in case of XSS?
             // one could change the homeserver as well so the token gets sent there, so both must be protected from read/write
-            this._homeserver = homeserver;
+            this._homeserver = homeServer;
             this._accessToken = accessToken;
+            this._requestFn = request;
         }
 
         _url(csPath) {
@@ -83,42 +80,12 @@ var main = (function () {
                 headers.append("Content-Type", "application/json");
                 bodyString = JSON.stringify(body);
             }
-            const controller = typeof AbortController === "function" ? new AbortController() : null;
-            // TODO: set authenticated headers with second arguments, cache them
-            let promise = fetch(url, {
+            const requestResult = this._requestFn(url, {
                 method,
                 headers,
                 body: bodyString,
-                signal: controller && controller.signal,
-                mode: "cors",
-                credentials: "omit",
-                referrer: "no-referrer",
-                cache: "no-cache",
             });
-            promise = promise.then(async (response) => {
-                if (response.ok) {
-                    return await response.json();
-                } else {
-                    switch (response.status) {
-                        default:
-                            throw new HomeServerError(method, url, await response.json())
-                    }
-                }
-            }, err => {
-                if (err.name === "AbortError") {
-                    throw new RequestAbortError();
-                } else if (err instanceof TypeError) {
-                    // Network errors are reported as TypeErrors, see
-                    // https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch#Checking_that_the_fetch_was_successful
-                    // this can either mean user is offline, server is offline, or a CORS error (server misconfiguration).
-                    // 
-                    // One could check navigator.onLine to rule out the first
-                    // but the 2 later ones are indistinguishable from javascript.
-                    throw new NetworkError(`${method} ${url}: ${err.message}`);
-                }
-                throw err;
-            });
-            return new RequestWrapper(promise, controller);
+            return new RequestWrapper(method, url, requestResult);
         }
 
         _post(csPath, queryParams, body) {
@@ -160,6 +127,68 @@ var main = (function () {
         createFilter(userId, filter) {
             return this._post(`/user/${encodeURIComponent(userId)}/filter`, undefined, filter);
         }
+    }
+
+    class RequestResult {
+        constructor(promise, controller) {
+            if (!controller) {
+                const abortPromise = new Promise((_, reject) => {
+                    this._controller = {
+                        abort() {
+                            const err = new Error("fetch request aborted");
+                            err.name = "AbortError";
+                            reject(err);
+                        }
+                    };
+                });
+                this._promise = Promise.race([promise, abortPromise]);
+            } else {
+                this._promise = promise;
+                this._controller = controller;
+            }
+        }
+
+        abort() {
+            this._controller.abort();
+        }
+
+        response() {
+            return this._promise;
+        }
+    }
+
+    function fetchRequest(url, options) {
+        const controller = typeof AbortController === "function" ? new AbortController() : null;
+        if (controller) {
+            options = Object.assign(options, {
+                signal: controller.signal
+            });
+        }
+        options = Object.assign(options, {
+            mode: "cors",
+            credentials: "omit",
+            referrer: "no-referrer",
+            cache: "no-cache",
+        });
+        const promise = fetch(url, options).then(async response => {
+            const {status} = response;
+            const body = await response.json();
+            return {status, body};
+        }, err => {
+            if (err.name === "AbortError") {
+                throw new RequestAbortError();
+            } else if (err instanceof TypeError) {
+                // Network errors are reported as TypeErrors, see
+                // https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch#Checking_that_the_fetch_was_successful
+                // this can either mean user is offline, server is offline, or a CORS error (server misconfiguration).
+                // 
+                // One could check navigator.onLine to rule out the first
+                // but the 2 later ones are indistinguishable from javascript.
+                throw new NetworkError(`${options.method} ${url}: ${err.message}`);
+            }
+            throw err;
+        });
+        return new RequestResult(promise, controller);
     }
 
     const STORE_NAMES = Object.freeze([
@@ -1149,17 +1178,55 @@ var main = (function () {
         }
     }
 
+    async function exportSession(db) {
+        const NOT_DONE = {done: false};
+        const txn = db.transaction(STORE_NAMES, "readonly");
+        const data = {};
+        await Promise.all(STORE_NAMES.map(async name => {
+            const results = data[name] = [];  // initialize in deterministic order
+            const store = txn.objectStore(name);
+            await iterateCursor(store.openCursor(), (value) => {
+                results.push(value);
+                return NOT_DONE;
+            });
+        }));
+        return data;
+    }
+
+    async function importSession(db, data) {
+        const txn = db.transaction(STORE_NAMES, "readwrite");
+        for (const name of STORE_NAMES) {
+            const store = txn.objectStore(name);
+            for (const value of data[name]) {
+                store.add(value);
+            }
+        }
+        await txnAsPromise(txn);
+    }
+
+    const sessionName = sessionId => `brawl_session_${sessionId}`;
+    const openDatabaseWithSessionId = sessionId => openDatabase(sessionName(sessionId), createStores, 1);
+
     class StorageFactory {
         async create(sessionId) {
-            const databaseName = `brawl_session_${sessionId}`;
-            const db = await openDatabase(databaseName, createStores, 1);
+            const db = await openDatabaseWithSessionId(sessionId);
             return new Storage(db);
         }
 
         delete(sessionId) {
-            const databaseName = `brawl_session_${sessionId}`;
+            const databaseName = sessionName(sessionId);
             const req = window.indexedDB.deleteDatabase(databaseName);
             return reqAsPromise(req);
+        }
+
+        async export(sessionId) {
+            const db = await openDatabaseWithSessionId(sessionId);
+            return await exportSession(db);
+        }
+
+        async import(sessionId, data) {
+            const db = await openDatabaseWithSessionId(sessionId);
+            return await importSession(db, data);
         }
     }
 
@@ -1729,9 +1796,8 @@ var main = (function () {
     }
 
     class SyncWriter {
-        constructor({roomId, storage, fragmentIdComparer}) {
+        constructor({roomId, fragmentIdComparer}) {
             this._roomId = roomId;
-            this._storage = storage;
             this._fragmentIdComparer = fragmentIdComparer;
             this._lastLiveKey = null;
         }
@@ -1796,23 +1862,23 @@ var main = (function () {
         async writeSync(roomResponse, txn) {
             const entries = [];
             const timeline = roomResponse.timeline;
-            if (!this._lastLiveKey) {
+            let currentKey = this._lastLiveKey;
+            if (!currentKey) {
                 // means we haven't synced this room yet (just joined or did initial sync)
                 
                 // as this is probably a limited sync, prev_batch should be there
                 // (but don't fail if it isn't, we won't be able to back-paginate though)
                 let liveFragment = await this._createLiveFragment(txn, timeline.prev_batch);
-                this._lastLiveKey = new EventKey(liveFragment.id, EventKey.defaultLiveKey.eventIndex);
+                currentKey = new EventKey(liveFragment.id, EventKey.defaultLiveKey.eventIndex);
                 entries.push(FragmentBoundaryEntry.start(liveFragment, this._fragmentIdComparer));
             } else if (timeline.limited) {
                 // replace live fragment for limited sync, *only* if we had a live fragment already
-                const oldFragmentId = this._lastLiveKey.fragmentId;
-                this._lastLiveKey = this._lastLiveKey.nextFragmentKey();
-                const {oldFragment, newFragment} = await this._replaceLiveFragment(oldFragmentId, this._lastLiveKey.fragmentId, timeline.prev_batch, txn);
+                const oldFragmentId = currentKey.fragmentId;
+                currentKey = currentKey.nextFragmentKey();
+                const {oldFragment, newFragment} = await this._replaceLiveFragment(oldFragmentId, currentKey.fragmentId, timeline.prev_batch, txn);
                 entries.push(FragmentBoundaryEntry.end(oldFragment, this._fragmentIdComparer));
                 entries.push(FragmentBoundaryEntry.start(newFragment, this._fragmentIdComparer));
             }
-            let currentKey = this._lastLiveKey;
             if (timeline.events) {
                 const events = deduplicateEvents(timeline.events);
                 for(const event of events) {
@@ -1822,12 +1888,6 @@ var main = (function () {
                     entries.push(new EventEntry(entry, this._fragmentIdComparer));
                 }
             }
-            // right thing to do? if the txn fails, not sure we'll continue anyways ...
-            // only advance the key once the transaction has succeeded 
-            txn.complete().then(() => {
-                this._lastLiveKey = currentKey;
-            });
-
             // persist state
             const state = roomResponse.state;
             if (state.events) {
@@ -1844,7 +1904,11 @@ var main = (function () {
                 }
             }
 
-            return entries;
+            return {entries, newLiveKey: currentKey};
+        }
+
+        setKeyOnCompleted(newLiveKey) {
+            this._lastLiveKey = newLiveKey;
         }
     }
     //#endif
@@ -3146,7 +3210,7 @@ var main = (function () {
             this._hsApi = hsApi;
     		this._summary = new RoomSummary(roomId);
             this._fragmentIdComparer = new FragmentIdComparer([]);
-    		this._syncWriter = new SyncWriter({roomId, storage, fragmentIdComparer: this._fragmentIdComparer});
+    		this._syncWriter = new SyncWriter({roomId, fragmentIdComparer: this._fragmentIdComparer});
             this._emitCollectionChange = emitCollectionChange;
             this._sendQueue = new SendQueue({roomId, storage, sendScheduler, pendingEvents});
             this._timeline = null;
@@ -3155,19 +3219,20 @@ var main = (function () {
 
         async persistSync(roomResponse, membership, txn) {
     		const summaryChanged = this._summary.applySync(roomResponse, membership, txn);
-    		const newTimelineEntries = await this._syncWriter.writeSync(roomResponse, txn);
+    		const {entries, newLiveKey} = await this._syncWriter.writeSync(roomResponse, txn);
             let removedPendingEvents;
             if (roomResponse.timeline && roomResponse.timeline.events) {
                 removedPendingEvents = this._sendQueue.removeRemoteEchos(roomResponse.timeline.events, txn);
             }
-            return {summaryChanged, newTimelineEntries, removedPendingEvents};
+            return {summaryChanged, newTimelineEntries: entries, newLiveKey, removedPendingEvents};
         }
 
-        emitSync({summaryChanged, newTimelineEntries, removedPendingEvents}) {
+        emitSync({summaryChanged, newTimelineEntries, newLiveKey, removedPendingEvents}) {
             if (summaryChanged) {
                 this.emit("change");
                 this._emitCollectionChange(this);
             }
+            this._syncWriter.setKeyOnCompleted(newLiveKey);
             if (this._timeline) {
                 this._timeline.appendLiveEntries(newTimelineEntries);
             }
@@ -4372,7 +4437,7 @@ var main = (function () {
             this._isDeleting = false;
             this._isClearing = false;
             this._error = null;
-            this._showJSON = false;
+            this._exportDataUrl = null;
         }
 
         get error() {
@@ -4396,7 +4461,6 @@ var main = (function () {
 
         async clear() {
             this._isClearing = true;
-            this._showJSON = true;
             this.emit("change");
             try {
                 await this._pickerVM.clear(this.id);
@@ -4422,19 +4486,42 @@ var main = (function () {
             return this._sessionInfo.id;
         }
 
-        get userId() {
-            return this._sessionInfo.userId;
+        get label() {
+            const {userId, comment} =  this._sessionInfo;
+            if (comment) {
+                return `${userId} (${comment})`;
+            } else {
+                return userId;
+            }
         }
 
         get sessionInfo() {
             return this._sessionInfo;
         }
 
-        get json() {
-            if (this._showJSON) {
-                return JSON.stringify(this._sessionInfo);
+        get exportDataUrl() {
+            return this._exportDataUrl;
+        }
+
+        async export() {
+            try {
+                const data = await this._pickerVM._exportData(this._sessionInfo.id);
+                const json = JSON.stringify(data, undefined, 2);
+                const blob = new Blob([json], {type: "application/json"});
+                this._exportDataUrl = URL.createObjectURL(blob);
+                this.emit("change", "exportDataUrl");
+            } catch (err) {
+                alert(err.message);
+                console.error(err);
             }
-            return null;
+        }
+
+        clearExport() {
+            if (this._exportDataUrl) {
+                URL.revokeObjectURL(this._exportDataUrl);
+                this._exportDataUrl = null;
+                this.emit("change", "exportDataUrl");
+            }
         }
     }
 
@@ -4458,11 +4545,19 @@ var main = (function () {
             }
         }
 
+        async _exportData(id) {
+            const sessionInfo = await this._sessionStore.get(id);
+            const stores = await this._storageFactory.export(id);
+            const data = {sessionInfo, stores};
+            return data;
+        }
+
         async import(json) {
-            const sessionInfo = JSON.parse(json);
-            const sessionId = (Math.floor(Math.random() * Number.MAX_SAFE_INTEGER)).toString();
-            sessionInfo.id = sessionId;
-            sessionInfo.lastUsed = sessionId;
+            const data = JSON.parse(json);
+            const {sessionInfo} = data;
+            sessionInfo.comment = `Imported on ${new Date().toLocaleString()} from id ${sessionInfo.id}.`;
+            sessionInfo.id = createNewSessionId();
+            await this._storageFactory.import(sessionInfo.id, data.stores);
             await this._sessionStore.add(sessionInfo);
             this._sessions.set(new SessionItemViewModel(sessionInfo, this));
         }
@@ -4485,6 +4580,10 @@ var main = (function () {
         cancel() {
             this._sessionCallback();
         }
+    }
+
+    function createNewSessionId() {
+        return (Math.floor(Math.random() * Number.MAX_SAFE_INTEGER)).toString();
     }
 
     class BrawlViewModel extends EventEmitter {
@@ -4575,7 +4674,7 @@ var main = (function () {
         async _onLoginFinished(loginData) {
             if (loginData) {
                 // TODO: extract random() as it is a source of non-determinism
-                const sessionId = (Math.floor(Math.random() * Number.MAX_SAFE_INTEGER)).toString();
+                const sessionId = createNewSessionId();
                 const sessionInfo = {
                     id: sessionId,
                     deviceId: loginData.device_id,
@@ -4710,7 +4809,7 @@ var main = (function () {
     }
 
     const TAG_NAMES = [
-        "ol", "ul", "li", "div", "h1", "h2", "h3", "h4", "h5", "h6",
+        "a", "ol", "ul", "li", "div", "h1", "h2", "h3", "h4", "h5", "h6",
         "p", "strong", "em", "span", "img", "section", "main", "article", "aside",
         "pre", "button", "time", "input", "textarea"];
 
@@ -5450,49 +5549,78 @@ var main = (function () {
                     onClick: () => vm.login(username.value, password.value, homeserver.value),
                     disabled: vm => vm.loading
                 }, "Log In")),
-                t.div(t.button({onClick: () => vm.cancel()}, ["Pick an existing session"]))
+                t.div(t.button({onClick: () => vm.cancel()}, ["Pick an existing session"])),
+                t.p(t.a({href: "https://github.com/bwindels/brawl-chat"}, ["Brawl on Github"]))
             ]);
         }
     }
 
+    function selectFileAsText(mimeType) {
+        const input = document.createElement("input");
+        input.setAttribute("type", "file");
+        if (mimeType) {
+            input.setAttribute("accept", mimeType);
+        }
+        const promise = new Promise((resolve, reject) => {
+            const checkFile = () => {
+                input.removeEventListener("change", checkFile, true);
+                const file = input.files[0];
+                if (file) {
+                    resolve(file.text());
+                } else {
+                    reject(new Error("No file selected"));
+                }
+            };
+            input.addEventListener("change", checkFile, true);
+        });
+        input.click();
+        return promise;
+    }
+
+
+
     class SessionPickerItemView extends TemplateView {
         constructor(vm) {
             super(vm, true);
-            this._onDeleteClick = this._onDeleteClick.bind(this);
-            this._onClearClick = this._onClearClick.bind(this);
         }
 
-        _onDeleteClick(event) {
-            event.stopPropagation();
-            event.preventDefault();
+        _onDeleteClick() {
             if (confirm("Are you sure?")) {
                 this.viewModel.delete();
             }
         }
 
-        _onClearClick(event) {
-            event.stopPropagation();
-            event.preventDefault();
-            this.viewModel.clear();
-        }
-
         render(t) {
             const deleteButton = t.button({
                 disabled: vm => vm.isDeleting,
-                onClick: this._onDeleteClick,
+                onClick: this._onDeleteClick.bind(this),
             }, "Delete");
             const clearButton = t.button({
                 disabled: vm => vm.isClearing,
-                onClick: this._onClearClick,
+                onClick: () => this.viewModel.clear(),
             }, "Clear");
-
-            const json = t.if(vm => vm.json, t => {
-                return t.div(t.pre(vm => vm.json));
+            const exportButton = t.button({
+                disabled: vm => vm.isClearing,
+                onClick: () => this.viewModel.export(),
+            }, "Export");
+            const downloadExport = t.if(vm => vm.exportDataUrl, (t, vm) => {
+                return t.a({
+                    href: vm.exportDataUrl,
+                    download: `brawl-session-${this.viewModel.id}.json`,
+                    onClick: () => setTimeout(() => this.viewModel.clearExport(), 100),
+                }, "Download");
             });
 
-            const userName = t.span({className: "userId"}, vm => vm.userId);
+            const userName = t.span({className: "userId"}, vm => vm.label);
             const errorMessage = t.if(vm => vm.error, t => t.span({className: "error"}, vm => vm.error));
-            return t.li([t.div({className: "sessionInfo"}, [userName, errorMessage, clearButton, deleteButton]), json]);
+            return t.li([t.div({className: "sessionInfo"}, [
+                userName,
+                errorMessage,
+                downloadExport,
+                exportButton,
+                clearButton,
+                deleteButton,
+            ])]);
         }
     }
 
@@ -5501,7 +5629,7 @@ var main = (function () {
             this._sessionList = new ListView({
                 list: this.viewModel.sessions,
                 onItemClick: (item, event) => {
-                    if (event.target.closest(".sessionInfo")) {
+                    if (event.target.closest(".userId")) {
                         this.viewModel.pick(item.viewModel.id);
                     }
                 },
@@ -5516,7 +5644,8 @@ var main = (function () {
                 t.h1(["Pick a session"]),
                 this._sessionList.mount(),
                 t.p(t.button({onClick: () => this.viewModel.cancel()}, ["Log in to a new session instead"])),
-                t.p(t.button({onClick: () => this.viewModel.import(prompt("JSON"))}, ["Import Session JSON"]))
+                t.p(t.button({onClick: async () => this.viewModel.import(await selectFileAsText("application/json"))}, "Import")),
+                t.p(t.a({href: "https://github.com/bwindels/brawl-chat"}, ["Brawl on Github"]))
             ]);
         }
 
@@ -5587,9 +5716,21 @@ var main = (function () {
 
     async function main(container) {
         try {
+            // to replay:
+            // const fetchLog = await (await fetch("/fetchlogs/constrainterror.json")).json();
+            // const replay = new ReplayRequester(fetchLog, {delay: false});
+            // const request = replay.request;
+
+            // to record:
+            // const recorder = new RecordRequester(fetchRequest);
+            // const request = recorder.request;
+            // window.getBrawlFetchLog = () => recorder.log();
+
+            // normal network:
+            const request = fetchRequest;
             const vm = new BrawlViewModel({
                 storageFactory: new StorageFactory(),
-                createHsApi: (homeServer, accessToken = null) => new HomeServerApi(homeServer, accessToken),
+                createHsApi: (homeServer, accessToken = null) => new HomeServerApi({homeServer, accessToken, request}),
                 sessionStore: new SessionsStore("brawl_sessions_v1"),
                 clock: Date //just for `now` fn
             });

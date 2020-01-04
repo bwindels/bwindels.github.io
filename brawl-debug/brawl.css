@@ -291,6 +291,9 @@ body {
 .LoginView {
   padding: 0.4em;
 }
+a {
+    color: white;
+}
 .form > div {
   margin: 0.4em 0;
 }
