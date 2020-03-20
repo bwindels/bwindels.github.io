@@ -1,4 +1,4 @@
-const VERSION = "0.0.15";
+const VERSION = "0.0.16";
 const FILES = ["brawl.js","brawl.css","index.html","icon-192.png"];
 const cacheName = `brawl-${VERSION}`;
 

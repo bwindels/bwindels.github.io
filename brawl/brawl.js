@@ -2,10 +2,10 @@ var main = (function () {
     'use strict';
 
     class HomeServerError extends Error {
-        constructor(method, url, body) {
-            super(`${body.error} on ${method} ${url}`);
-            this.errcode = body.errcode;
-            this.retry_after_ms = body.retry_after_ms;
+        constructor(method, url, body, status) {
+            super(`${body ? body.error : status} on ${method} ${url}`);
+            this.errcode = body ? body.errcode : null;
+            this.retry_after_ms = body ? body.retry_after_ms : 0;
         }
 
         get isFatal() {
@@ -31,7 +31,7 @@ var main = (function () {
                 } else {
                     switch (response.status) {
                         default:
-                            throw new HomeServerError(method, url, response.body);
+                            throw new HomeServerError(method, url, response.body, response.status);
                     }
                 }
             });
@@ -2794,7 +2794,13 @@ var main = (function () {
 
         /** @package */
         appendLiveEntries(newEntries) {
-            this._remoteEntries.setManySorted(newEntries);
+            try {
+                this._remoteEntries.setManySorted(newEntries);
+            } catch (err) {
+                console.error("error while appending live entries in roomId", this._roomId);
+                console.error(err.stack);
+                throw err;
+            }
         }
 
         /** @public */
@@ -2973,6 +2979,13 @@ var main = (function () {
 
         rebuild(fragments) {
             const islands = createIslands(fragments);
+            const fragmentJson = JSON.stringify(islands.map(i => {
+                return Array.from(i._idToSortIndex.entries())
+                    .map(([id, idx]) => {return {id, idx};})
+                    .sort((a, b) => a.idx - b.idx);
+            }));
+            const firstFragment = this._fragmentsById.values().next().value;
+            console.log("rebuilt fragment index", firstFragment && firstFragment.roomId, fragmentJson);
             this._idToIsland = new Map();
             for(let island of islands) {
                 for(let id of island.fragmentIds) {
@@ -3044,7 +3057,7 @@ var main = (function () {
                             pendingEvent.eventType,
                             pendingEvent.txnId,
                             pendingEvent.content
-                        );
+                        ).response();
                     });
                     pendingEvent.remoteId = response.event_id;
                     // 
