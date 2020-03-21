@@ -3669,7 +3669,43 @@ var main = (function () {
         }
     }
 
+    class UpdateAction {
+        constructor(remove, update, updateParams) {
+            this._remove = remove;
+            this._update = update;
+            this._updateParams = updateParams;
+        }
+
+        get shouldRemove() {
+            return this._remove;
+        }
+
+        get shouldUpdate() {
+            return this._update;
+        }
+
+        get updateParams() {
+            return this._updateParams;
+        }
+
+        static Remove() {
+            return new UpdateAction(true, false, null);
+        }
+
+        static Update(newParams) {
+            return new UpdateAction(false, true, newParams);
+        }
+
+        static Nothing() {
+            return new UpdateAction(false, false, null);
+        }
+    }
+
     // maps 1..n entries to 0..1 tile. Entries are what is stored in the timeline, either an event or fragmentboundary
+    // for now, tileCreator should be stable in whether it returns a tile or not.
+    // e.g. the decision to create a tile or not should be based on properties
+    // not updated later on (e.g. event type)
+    // also see big comment in onUpdate
     class TilesCollection extends BaseObservableList {
         constructor(entries, tileCreator) {
             super();
@@ -3696,7 +3732,7 @@ var main = (function () {
             let currentTile = null;
             for (let entry of this._entries) {
                 if (!currentTile || !currentTile.tryIncludeEntry(entry)) {
-                    currentTile = this._tileCreator(entry, this._emitSpontanousUpdate);
+                    currentTile = this._tileCreator(entry);
                     if (currentTile) {
                         this._tiles.push(currentTile);
                     }
@@ -3712,6 +3748,11 @@ var main = (function () {
             }
             if (prevTile) {
                 prevTile.updateNextSibling(null);
+            }
+            // now everything is wired up,
+            // allow tiles to emit updates
+            for (const tile of this._tiles) {
+                tile.setUpdateEmit(this._emitSpontanousUpdate);
             }
         }
 
@@ -3761,10 +3802,11 @@ var main = (function () {
                 return;
             }
 
-            const newTile = this._tileCreator(entry, this._emitSpontanousUpdate);
+            const newTile = this._tileCreator(entry);
             if (newTile) {
                 if (prevTile) {
                     prevTile.updateNextSibling(newTile);
+                    // this emits an update while the add hasn't been emitted yet
                     newTile.updatePreviousSibling(prevTile);
                 }
                 if (nextTile) {
@@ -3773,6 +3815,9 @@ var main = (function () {
                 }
                 this._tiles.splice(tileIdx, 0, newTile);
                 this.emitAdd(tileIdx, newTile);
+                // add event is emitted, now the tile
+                // can emit updates
+                newTile.setUpdateEmit(this._emitSpontanousUpdate);
             }
             // find position by sort key
             // ask siblings to be included? both? yes, twice: a (insert c here) b, ask a(c), if yes ask b(a), else ask b(c)? if yes then b(a)?
@@ -3809,6 +3854,7 @@ var main = (function () {
             this._tiles.splice(tileIdx, 1);
             prevTile && prevTile.updateNextSibling(nextTile);
             nextTile && nextTile.updatePreviousSibling(prevTile);
+            tile.setUpdateEmit(null);
             this.emitRemove(tileIdx, tile);
         }
 
@@ -3841,42 +3887,10 @@ var main = (function () {
         }
     }
 
-    class UpdateAction {
-        constructor(remove, update, updateParams) {
-            this._remove = remove;
-            this._update = update;
-            this._updateParams = updateParams;
-        }
-
-        get shouldRemove() {
-            return this._remove;
-        }
-
-        get shouldUpdate() {
-            return this._update;
-        }
-
-        get updateParams() {
-            return this._updateParams;
-        }
-
-        static Remove() {
-            return new UpdateAction(true, false, null);
-        }
-
-        static Update(newParams) {
-            return new UpdateAction(false, true, newParams);
-        }
-
-        static Nothing() {
-            return new UpdateAction(false, false, null);
-        }
-    }
-
     class SimpleTile {
-        constructor({entry, emitUpdate}) {
+        constructor({entry}) {
             this._entry = entry;
-            this._emitUpdate = emitUpdate;
+            this._emitUpdate = null;
         }
         // view model props for all subclasses
         // hmmm, could also do instanceof ... ?
@@ -3894,21 +3908,33 @@ var main = (function () {
         get hasDateSeparator() {
             return false;
         }
-        // TilesCollection contract? unused atm
+
+        emitUpdate(paramName) {
+            if (this._emitUpdate) {
+                this._emitUpdate(this, paramName);
+            }
+        }
+
+        get internalId() {
+            return this._entry.asEventKey().toString();
+        }
+
+        get isPending() {
+            return this._entry.isPending;
+        }
+        // TilesCollection contract below
+        setUpdateEmit(emitUpdate) {
+            this._emitUpdate = emitUpdate;
+        }
+
         get upperEntry() {
             return this._entry;
         }
 
-        // TilesCollection contract? unused atm
         get lowerEntry() {
             return this._entry;
         }
 
-        emitUpdate(paramName) {
-            this._emitUpdate(this, paramName);
-        }
-
-        // TilesCollection contract
         compareEntry(entry) {
             return this._entry.compare(entry);
         }
@@ -3938,14 +3964,7 @@ var main = (function () {
         updateNextSibling(next) {
         
         }
-
-        get internalId() {
-            return this._entry.asEventKey().toString();
-        }
-
-        get isPending() {
-            return this._entry.isPending;
-        }
+        // TilesCollection contract above
     }
 
     class GapTile extends SimpleTile {
