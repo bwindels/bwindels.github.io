@@ -1809,7 +1809,7 @@ var main = (function () {
                 nextToken: null
             };
             txn.timelineFragments.add(newFragment);
-            this._fragmentIdComparer.add(newFragment);
+            this._fragmentIdComparer.append(newFragmentId, oldFragmentId);
             return {oldFragment, newFragment};
         }
 
@@ -2794,13 +2794,7 @@ var main = (function () {
 
         /** @package */
         appendLiveEntries(newEntries) {
-            try {
-                this._remoteEntries.setManySorted(newEntries);
-            } catch (err) {
-                console.error("error while appending live entries in roomId", this._roomId);
-                console.error(err.stack);
-                throw err;
-            }
+            this._remoteEntries.setManySorted(newEntries);
         }
 
         /** @public */
@@ -2923,6 +2917,14 @@ var main = (function () {
         return islands.map(a => new Island(a));
     }
 
+    class Fragment {
+        constructor(id, previousId, nextId) {
+            this.id = id;
+            this.previousId = previousId;
+            this.nextId = nextId;
+        }
+    }
+
     class Island {
         constructor(sortedFragments) {
             this._idToSortIndex = new Map();
@@ -2979,13 +2981,6 @@ var main = (function () {
 
         rebuild(fragments) {
             const islands = createIslands(fragments);
-            const fragmentJson = JSON.stringify(islands.map(i => {
-                return Array.from(i._idToSortIndex.entries())
-                    .map(([id, idx]) => {return {id, idx};})
-                    .sort((a, b) => a.idx - b.idx);
-            }));
-            const firstFragment = this._fragmentsById.values().next().value;
-            console.log("rebuilt fragment index", firstFragment && firstFragment.roomId, fragmentJson);
             this._idToIsland = new Map();
             for(let island of islands) {
                 for(let id of island.fragmentIds) {
@@ -2994,8 +2989,32 @@ var main = (function () {
             }
         }
 
+        /** use for fragments coming out of persistence, not newly created ones, or also fragments for a new island (like for a permalink) */
         add(fragment) {
-            this._fragmentsById.set(fragment.id, fragment);
+            const copy = new Fragment(fragment.id, fragment.previousId, fragment.nextId);
+            this._fragmentsById.set(fragment.id, copy);
+            this.rebuild(this._fragmentsById.values());
+        }
+
+        /** use for appending newly created fragments */
+        append(id, previousId) {
+            const fragment = new Fragment(id, previousId, null);
+            const prevFragment = this._fragmentsById.get(previousId);
+            if (prevFragment) {
+                prevFragment.nextId = id;
+            }
+            this._fragmentsById.set(id, fragment);
+            this.rebuild(this._fragmentsById.values());
+        }
+
+        /** use for prepending newly created fragments */
+        prepend(id, nextId) {
+            const fragment = new Fragment(id, null, nextId);
+            const nextFragment = this._fragmentsById.get(nextId);
+            if (nextFragment) {
+                nextFragment.previousId = id;
+            }
+            this._fragmentsById.set(id, fragment);
             this.rebuild(this._fragmentsById.values());
         }
     }
