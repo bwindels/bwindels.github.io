@@ -1867,6 +1867,120 @@ var main = (function () {
     }
     //#endif
 
+    class GapWriter {
+        constructor({roomId, storage, fragmentIdComparer}) {
+            this._roomId = roomId;
+            this._storage = storage;
+            this._fragmentIdComparer = fragmentIdComparer;
+        }
+        // events is in reverse-chronological order (last event comes at index 0) if backwards
+        async _findOverlappingEvents(fragmentEntry, events, txn) {
+            const eventIds = events.map(e => e.event_id);
+            let nonOverlappingEvents = events;
+            let neighbourFragmentEntry;
+            const neighbourEventId = await txn.timelineEvents.findFirstOccurringEventId(this._roomId, eventIds);
+            if (neighbourEventId) {
+                // trim overlapping events
+                const neighbourEventIndex = events.findIndex(e => e.event_id === neighbourEventId);
+                nonOverlappingEvents = events.slice(0, neighbourEventIndex);
+                // get neighbour fragment to link it up later on
+                const neighbourEvent = await txn.timelineEvents.getByEventId(this._roomId, neighbourEventId);
+                const neighbourFragment = await txn.timelineFragments.get(this._roomId, neighbourEvent.fragmentId);
+                neighbourFragmentEntry = fragmentEntry.createNeighbourEntry(neighbourFragment);
+            }
+            return {nonOverlappingEvents, neighbourFragmentEntry};
+        }
+
+        async _findLastFragmentEventKey(fragmentEntry, txn) {
+            const {fragmentId, direction} = fragmentEntry;
+            if (direction.isBackward) {
+                const [firstEvent] = await txn.timelineEvents.firstEvents(this._roomId, fragmentId, 1);
+                return new EventKey(firstEvent.fragmentId, firstEvent.eventIndex);
+            } else {
+                const [lastEvent] = await txn.timelineEvents.lastEvents(this._roomId, fragmentId, 1);
+                return new EventKey(lastEvent.fragmentId, lastEvent.eventIndex);
+            }
+        }
+
+        _storeEvents(events, startKey, direction, txn) {
+            const entries = [];
+            // events is in reverse chronological order for backwards pagination,
+            // e.g. order is moving away from the `from` point.
+            let key = startKey;
+            for(let event of events) {
+                key = key.nextKeyForDirection(direction);
+                const eventStorageEntry = createEventEntry(key, this._roomId, event);
+                txn.timelineEvents.insert(eventStorageEntry);
+                const eventEntry = new EventEntry(eventStorageEntry, this._fragmentIdComparer);
+                directionalAppend(entries, eventEntry, direction);
+            }
+            return entries;
+        }
+
+        async _updateFragments(fragmentEntry, neighbourFragmentEntry, end, entries, txn) {
+            const {direction} = fragmentEntry;
+            directionalAppend(entries, fragmentEntry, direction);
+            // set `end` as token, and if we found an event in the step before, link up the fragments in the fragment entry
+            if (neighbourFragmentEntry) {
+                fragmentEntry.linkedFragmentId = neighbourFragmentEntry.fragmentId;
+                neighbourFragmentEntry.linkedFragmentId = fragmentEntry.fragmentId;
+                // if neighbourFragmentEntry was found, it means the events were overlapping,
+                // so no pagination should happen anymore.
+                neighbourFragmentEntry.token = null;
+                fragmentEntry.token = null;
+
+                txn.timelineFragments.update(neighbourFragmentEntry.fragment);
+                directionalAppend(entries, neighbourFragmentEntry, direction);
+
+                // update fragmentIdComparer here after linking up fragments
+                this._fragmentIdComparer.add(fragmentEntry.fragment);
+                this._fragmentIdComparer.add(neighbourFragmentEntry.fragment);
+            } else {
+                fragmentEntry.token = end;
+            }
+            txn.timelineFragments.update(fragmentEntry.fragment);
+        }
+
+        async writeFragmentFill(fragmentEntry, response, txn) {
+            const {fragmentId, direction} = fragmentEntry;
+            // chunk is in reverse-chronological order when backwards
+            const {chunk, start, end} = response;
+            let entries;
+
+            if (!Array.isArray(chunk)) {
+                throw new Error("Invalid chunk in response");
+            }
+            if (typeof end !== "string") {
+                throw new Error("Invalid end token in response");
+            }
+
+            // make sure we have the latest fragment from the store
+            const fragment = await txn.timelineFragments.get(this._roomId, fragmentId);
+            if (!fragment) {
+                throw new Error(`Unknown fragment: ${fragmentId}`);
+            }
+            fragmentEntry = fragmentEntry.withUpdatedFragment(fragment);
+            // check that the request was done with the token we are aware of (extra care to avoid timeline corruption)
+            if (fragmentEntry.token !== start) {
+                throw new Error("start is not equal to prev_batch or next_batch");
+            }
+            // find last event in fragment so we get the eventIndex to begin creating keys at
+            let lastKey = await this._findLastFragmentEventKey(fragmentEntry, txn);
+            // find out if any event in chunk is already present using findFirstOrLastOccurringEventId
+            const {
+                nonOverlappingEvents,
+                neighbourFragmentEntry
+            } = await this._findOverlappingEvents(fragmentEntry, chunk, txn);
+
+            // create entries for all events in chunk, add them to entries
+            entries = this._storeEvents(nonOverlappingEvents, lastKey, direction, txn);
+            await this._updateFragments(fragmentEntry, neighbourFragmentEntry, end, entries, txn);
+        
+            return entries;
+        }
+    }
+    //#endif
+
     class BaseObservableCollection {
         constructor() {
             this._handlers = new Set();
@@ -2508,132 +2622,6 @@ var main = (function () {
         }
     });
 
-    class GapWriter {
-        constructor({roomId, storage, fragmentIdComparer}) {
-            this._roomId = roomId;
-            this._storage = storage;
-            this._fragmentIdComparer = fragmentIdComparer;
-        }
-        // events is in reverse-chronological order (last event comes at index 0) if backwards
-        async _findOverlappingEvents(fragmentEntry, events, txn) {
-            const eventIds = events.map(e => e.event_id);
-            let nonOverlappingEvents = events;
-            let neighbourFragmentEntry;
-            const neighbourEventId = await txn.timelineEvents.findFirstOccurringEventId(this._roomId, eventIds);
-            if (neighbourEventId) {
-                // trim overlapping events
-                const neighbourEventIndex = events.findIndex(e => e.event_id === neighbourEventId);
-                nonOverlappingEvents = events.slice(0, neighbourEventIndex);
-                // get neighbour fragment to link it up later on
-                const neighbourEvent = await txn.timelineEvents.getByEventId(this._roomId, neighbourEventId);
-                const neighbourFragment = await txn.timelineFragments.get(this._roomId, neighbourEvent.fragmentId);
-                neighbourFragmentEntry = fragmentEntry.createNeighbourEntry(neighbourFragment);
-            }
-            return {nonOverlappingEvents, neighbourFragmentEntry};
-        }
-
-        async _findLastFragmentEventKey(fragmentEntry, txn) {
-            const {fragmentId, direction} = fragmentEntry;
-            if (direction.isBackward) {
-                const [firstEvent] = await txn.timelineEvents.firstEvents(this._roomId, fragmentId, 1);
-                return new EventKey(firstEvent.fragmentId, firstEvent.eventIndex);
-            } else {
-                const [lastEvent] = await txn.timelineEvents.lastEvents(this._roomId, fragmentId, 1);
-                return new EventKey(lastEvent.fragmentId, lastEvent.eventIndex);
-            }
-        }
-
-        _storeEvents(events, startKey, direction, txn) {
-            const entries = [];
-            // events is in reverse chronological order for backwards pagination,
-            // e.g. order is moving away from the `from` point.
-            let key = startKey;
-            for(let event of events) {
-                key = key.nextKeyForDirection(direction);
-                const eventStorageEntry = createEventEntry(key, this._roomId, event);
-                txn.timelineEvents.insert(eventStorageEntry);
-                const eventEntry = new EventEntry(eventStorageEntry, this._fragmentIdComparer);
-                directionalAppend(entries, eventEntry, direction);
-            }
-            return entries;
-        }
-
-        async _updateFragments(fragmentEntry, neighbourFragmentEntry, end, entries, txn) {
-            const {direction} = fragmentEntry;
-            directionalAppend(entries, fragmentEntry, direction);
-            // set `end` as token, and if we found an event in the step before, link up the fragments in the fragment entry
-            if (neighbourFragmentEntry) {
-                fragmentEntry.linkedFragmentId = neighbourFragmentEntry.fragmentId;
-                neighbourFragmentEntry.linkedFragmentId = fragmentEntry.fragmentId;
-                // if neighbourFragmentEntry was found, it means the events were overlapping,
-                // so no pagination should happen anymore.
-                neighbourFragmentEntry.token = null;
-                fragmentEntry.token = null;
-
-                txn.timelineFragments.update(neighbourFragmentEntry.fragment);
-                directionalAppend(entries, neighbourFragmentEntry, direction);
-
-                // update fragmentIdComparer here after linking up fragments
-                this._fragmentIdComparer.add(fragmentEntry.fragment);
-                this._fragmentIdComparer.add(neighbourFragmentEntry.fragment);
-            } else {
-                fragmentEntry.token = end;
-            }
-            txn.timelineFragments.update(fragmentEntry.fragment);
-        }
-
-        async writeFragmentFill(fragmentEntry, response) {
-            const {fragmentId, direction} = fragmentEntry;
-            // chunk is in reverse-chronological order when backwards
-            const {chunk, start, end} = response;
-            let entries;
-
-            if (!Array.isArray(chunk)) {
-                throw new Error("Invalid chunk in response");
-            }
-            if (typeof end !== "string") {
-                throw new Error("Invalid end token in response");
-            }
-
-            const txn = await this._storage.readWriteTxn([
-                this._storage.storeNames.timelineEvents,
-                this._storage.storeNames.timelineFragments,
-            ]);
-
-            try {
-                // make sure we have the latest fragment from the store
-                const fragment = await txn.timelineFragments.get(this._roomId, fragmentId);
-                if (!fragment) {
-                    throw new Error(`Unknown fragment: ${fragmentId}`);
-                }
-                fragmentEntry = fragmentEntry.withUpdatedFragment(fragment);
-                // check that the request was done with the token we are aware of (extra care to avoid timeline corruption)
-                if (fragmentEntry.token !== start) {
-                    throw new Error("start is not equal to prev_batch or next_batch");
-                }
-                // find last event in fragment so we get the eventIndex to begin creating keys at
-                let lastKey = await this._findLastFragmentEventKey(fragmentEntry, txn);
-                // find out if any event in chunk is already present using findFirstOrLastOccurringEventId
-                const {
-                    nonOverlappingEvents,
-                    neighbourFragmentEntry
-                } = await this._findOverlappingEvents(fragmentEntry, chunk, txn);
-
-                // create entries for all events in chunk, add them to entries
-                entries = this._storeEvents(nonOverlappingEvents, lastKey, direction, txn);
-                await this._updateFragments(fragmentEntry, neighbourFragmentEntry, end, entries, txn);
-            } catch (err) {
-                txn.abort();
-                throw err;
-            }
-
-            await txn.complete();
-
-            return entries;
-        }
-    }
-    //#endif
-
     class TimelineReader {
         constructor({roomId, storage, fragmentIdComparer}) {
             this._roomId = roomId;
@@ -2766,12 +2754,11 @@ var main = (function () {
     }
 
     class Timeline {
-        constructor({roomId, storage, closeCallback, fragmentIdComparer, pendingEvents, user, hsApi}) {
+        constructor({roomId, storage, closeCallback, fragmentIdComparer, pendingEvents, user}) {
             this._roomId = roomId;
             this._storage = storage;
             this._closeCallback = closeCallback;
             this._fragmentIdComparer = fragmentIdComparer;
-            this._hsApi = hsApi;
             this._remoteEntries = new SortedArray((a, b) => a.compare(b));
             this._timelineReader = new TimelineReader({
                 roomId: this._roomId,
@@ -2797,23 +2784,11 @@ var main = (function () {
             this._remoteEntries.setManySorted(newEntries);
         }
 
-        /** @public */
-        async fillGap(fragmentEntry, amount) {
-            const response = await this._hsApi.messages(this._roomId, {
-                from: fragmentEntry.token,
-                dir: fragmentEntry.direction.asApiString(),
-                limit: amount,
-                filter: {lazy_load_members: true}
-            }).response();
-            const gapWriter = new GapWriter({
-                roomId: this._roomId,
-                storage: this._storage,
-                fragmentIdComparer: this._fragmentIdComparer
-            });
-            const newEntries = await gapWriter.writeFragmentFill(fragmentEntry, response);
+        /** @package */
+        addGapEntries(newEntries) {
             this._remoteEntries.setManySorted(newEntries);
         }
-
+        
         // tries to prepend `amount` entries to the `entries` list.
         async loadAtTop(amount) {
             const firstEventEntry = this._remoteEntries.array.find(e => !!e.eventType);
@@ -3097,13 +3072,16 @@ var main = (function () {
             const removed = [];
             for (const event of events) {
                 const txnId = event.unsigned && event.unsigned.transaction_id;
+                let idx;
                 if (txnId) {
-                    const idx = this._pendingEvents.array.findIndex(pe => pe.txnId === txnId);
-                    if (idx !== -1) {
-                        const pendingEvent = this._pendingEvents.get(idx);
-                        txn.pendingEvents.remove(pendingEvent.roomId, pendingEvent.queueIndex);
-                        removed.push(pendingEvent);
-                    }
+                    idx = this._pendingEvents.array.findIndex(pe => pe.txnId === txnId);
+                } else {
+                    idx = this._pendingEvents.array.findIndex(pe => pe.remoteId === event.event_id);
+                }
+                if (idx !== -1) {
+                    const pendingEvent = this._pendingEvents.get(idx);
+                    txn.pendingEvents.remove(pendingEvent.roomId, pendingEvent.queueIndex);
+                    removed.push(pendingEvent);
                 }
             }
             return removed;
@@ -3241,6 +3219,47 @@ var main = (function () {
             this._sendQueue.enqueueEvent(eventType, content);
         }
 
+
+        /** @public */
+        async fillGap(fragmentEntry, amount) {
+            const response = await this._hsApi.messages(this._roomId, {
+                from: fragmentEntry.token,
+                dir: fragmentEntry.direction.asApiString(),
+                limit: amount,
+                filter: {lazy_load_members: true}
+            }).response();
+
+            const txn = await this._storage.readWriteTxn([
+                this._storage.storeNames.pendingEvents,
+                this._storage.storeNames.timelineEvents,
+                this._storage.storeNames.timelineFragments,
+            ]);
+            let removedPendingEvents;
+            let newEntries;
+            try {
+                // detect remote echos of pending messages in the gap
+                removedPendingEvents = this._sendQueue.removeRemoteEchos(response.chunk, txn);
+                // write new events into gap
+                const gapWriter = new GapWriter({
+                    roomId: this._roomId,
+                    storage: this._storage,
+                    fragmentIdComparer: this._fragmentIdComparer
+                });
+                newEntries = await gapWriter.writeFragmentFill(fragmentEntry, response, txn);
+            } catch (err) {
+                txn.abort();
+                throw err;
+            }
+            await txn.complete();
+            // once txn is committed, emit events
+            if (removedPendingEvents) {
+                this._sendQueue.emitRemovals(removedPendingEvents);
+            }
+            if (this._timeline) {
+                this._timeline.addGapEntries(newEntries);
+            }
+        }
+
         get name() {
             return this._summary.name;
         }
@@ -3256,7 +3275,6 @@ var main = (function () {
             this._timeline = new Timeline({
                 roomId: this.id,
                 storage: this._storage,
-                hsApi: this._hsApi,
                 fragmentIdComparer: this._fragmentIdComparer,
                 pendingEvents: this._sendQueue.pendingEvents,
                 closeCallback: () => this._timeline = null,
@@ -4142,11 +4160,11 @@ var main = (function () {
         }
     }
 
-    function tilesCreator ({timeline, ownUserId}) {
+    function tilesCreator ({room, ownUserId}) {
         return function tilesCreator(entry, emitUpdate) {
             const options = {entry, emitUpdate, ownUserId};
             if (entry.isGap) {
-                return new GapTile(options, timeline);
+                return new GapTile(options, room);
             } else if (entry.eventType) {
                 switch (entry.eventType) {
                     case "m.room.message": {
@@ -4197,12 +4215,12 @@ var main = (function () {
     */
 
     class TimelineViewModel {
-        constructor(timeline, ownUserId) {
+        constructor(room, timeline, ownUserId) {
             this._timeline = timeline;
             // once we support sending messages we could do
             // timeline.entries.concat(timeline.pendingEvents)
             // for an ObservableList that also contains local echos
-            this._tiles = new TilesCollection(timeline.entries, tilesCreator({timeline, ownUserId}));
+            this._tiles = new TilesCollection(timeline.entries, tilesCreator({room, ownUserId}));
         }
 
         // doesn't fill gaps, only loads stored entries/tiles
@@ -4245,7 +4263,7 @@ var main = (function () {
             this._room.on("change", this._onRoomChange);
             try {
                 this._timeline = await this._room.openTimeline();
-                this._timelineVM = new TimelineViewModel(this._timeline, this._ownUserId);
+                this._timelineVM = new TimelineViewModel(this._room, this._timeline, this._ownUserId);
                 this.emit("change", "timelineViewModel");
             } catch (err) {
                 console.error(`room.openTimeline(): ${err.message}:\n${err.stack}`);
@@ -5546,6 +5564,14 @@ var main = (function () {
         update() {}
     }
 
+    function brawlGithubLink(t) {
+        if (window.BRAWL_VERSION) {
+            return t.a({target: "_blank", href: `https://github.com/bwindels/brawl-chat/releases/tag/v${window.BRAWL_VERSION}`}, `Brawl v${window.BRAWL_VERSION} on Github`);
+        } else {
+            return t.a({target: "_blank", href: "https://github.com/bwindels/brawl-chat"}, "Brawl on Github");
+        }
+    }
+
     class LoginView extends TemplateView {
         constructor(vm) {
             super(vm, true);
@@ -5566,7 +5592,7 @@ var main = (function () {
                     disabled: vm => vm.loading
                 }, "Log In")),
                 t.div(t.button({onClick: () => vm.cancel()}, ["Pick an existing session"])),
-                t.p(t.a({href: "https://github.com/bwindels/brawl-chat"}, ["Brawl on Github"]))
+                t.p(brawlGithubLink(t))
             ]);
         }
     }
@@ -5661,7 +5687,7 @@ var main = (function () {
                 this._sessionList.mount(),
                 t.p(t.button({onClick: () => this.viewModel.cancel()}, ["Log in to a new session instead"])),
                 t.p(t.button({onClick: async () => this.viewModel.import(await selectFileAsText("application/json"))}, "Import")),
-                t.p(t.a({href: "https://github.com/bwindels/brawl-chat"}, ["Brawl on Github"]))
+                t.p(brawlGithubLink(t))
             ]);
         }
 
