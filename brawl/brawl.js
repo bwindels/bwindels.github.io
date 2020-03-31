@@ -690,7 +690,11 @@ var main = (function () {
         }
 
         static get defaultLiveKey() {
-            return new EventKey(Platform.minStorageKey, Platform.middleStorageKey);
+            return EventKey.defaultFragmentKey(Platform.minStorageKey);
+        }
+
+        static defaultFragmentKey(fragmentId) {
+            return new EventKey(fragmentId, Platform.middleStorageKey);
         }
 
         toString() {
@@ -1559,6 +1563,11 @@ var main = (function () {
             return this._eventEntry.event.content;
         }
 
+        get prevContent() {
+            const unsigned = this._eventEntry.event.unsigned;
+            return unsigned && unsigned.prev_content;
+        }
+
         get eventType() {
             return this._eventEntry.event.type;
         }
@@ -1595,6 +1604,10 @@ var main = (function () {
 
         asApiString() {
             return this.isForward ? "f" : "b";
+        }
+
+        reverse() {
+            return this.isForward ? Direction.Backward : Direction.Forward
         }
 
         static get Forward() {
@@ -1875,30 +1888,75 @@ var main = (function () {
         }
         // events is in reverse-chronological order (last event comes at index 0) if backwards
         async _findOverlappingEvents(fragmentEntry, events, txn) {
-            const eventIds = events.map(e => e.event_id);
-            let nonOverlappingEvents = events;
+            let expectedOverlappingEventId;
+            if (fragmentEntry.hasLinkedFragment) {
+                expectedOverlappingEventId = await this._findExpectedOverlappingEventId(fragmentEntry, txn);
+            }
+            let remainingEvents = events;
+            let nonOverlappingEvents = [];
             let neighbourFragmentEntry;
-            const neighbourEventId = await txn.timelineEvents.findFirstOccurringEventId(this._roomId, eventIds);
-            if (neighbourEventId) {
-                // trim overlapping events
-                const neighbourEventIndex = events.findIndex(e => e.event_id === neighbourEventId);
-                nonOverlappingEvents = events.slice(0, neighbourEventIndex);
-                // get neighbour fragment to link it up later on
-                const neighbourEvent = await txn.timelineEvents.getByEventId(this._roomId, neighbourEventId);
-                const neighbourFragment = await txn.timelineFragments.get(this._roomId, neighbourEvent.fragmentId);
-                neighbourFragmentEntry = fragmentEntry.createNeighbourEntry(neighbourFragment);
+            while (remainingEvents && remainingEvents.length) {
+                const eventIds = remainingEvents.map(e => e.event_id);
+                const duplicateEventId = await txn.timelineEvents.findFirstOccurringEventId(this._roomId, eventIds);
+                if (duplicateEventId) {
+                    const duplicateEventIndex = remainingEvents.findIndex(e => e.event_id === duplicateEventId);
+                    // should never happen, just being defensive as this *can't* go wrong
+                    if (duplicateEventIndex === -1) {
+                        throw new Error(`findFirstOccurringEventId returned ${duplicateEventIndex} which wasn't ` +
+                            `in [${eventIds.join(",")}] in ${this._roomId}`);
+                    }
+                    nonOverlappingEvents.push(...remainingEvents.slice(0, duplicateEventIndex));
+                    if (!expectedOverlappingEventId || duplicateEventId === expectedOverlappingEventId) {
+                        // TODO: check here that the neighbourEvent is at the correct edge of it's fragment
+                        // get neighbour fragment to link it up later on
+                        const neighbourEvent = await txn.timelineEvents.getByEventId(this._roomId, duplicateEventId);
+                        const neighbourFragment = await txn.timelineFragments.get(this._roomId, neighbourEvent.fragmentId);
+                        neighbourFragmentEntry = fragmentEntry.createNeighbourEntry(neighbourFragment);
+                        // trim overlapping events
+                        remainingEvents = null;
+                    } else {
+                        // we've hit https://github.com/matrix-org/synapse/issues/7164, 
+                        // e.g. the event id we found is already in our store but it is not
+                        // the adjacent fragment id. Ignore the event, but keep processing the ones after.
+                        remainingEvents = remainingEvents.slice(duplicateEventIndex + 1);
+                    }
+                } else {
+                    nonOverlappingEvents.push(...remainingEvents);
+                    remainingEvents = null;
+                }
             }
             return {nonOverlappingEvents, neighbourFragmentEntry};
         }
 
-        async _findLastFragmentEventKey(fragmentEntry, txn) {
+        async _findExpectedOverlappingEventId(fragmentEntry, txn) {
+            const eventEntry = await this._findFragmentEdgeEvent(
+                fragmentEntry.linkedFragmentId,
+                // reverse because it's the oppose edge of the linked fragment
+                fragmentEntry.direction.reverse(),
+                txn);
+            if (eventEntry) {
+                return eventEntry.event.event_id;
+            }
+        }
+
+        async _findFragmentEdgeEventKey(fragmentEntry, txn) {
             const {fragmentId, direction} = fragmentEntry;
+            const event = await this._findFragmentEdgeEvent(fragmentId, direction, txn);
+            if (event) {
+                return new EventKey(event.fragmentId, event.eventIndex);
+            } else {
+                // no events yet in the fragment ... odd, but let's not fail and take the default key
+                return EventKey.defaultFragmentKey(fragmentEntry.fragmentId);
+            }
+        }
+
+        async _findFragmentEdgeEvent(fragmentId, direction, txn) {
             if (direction.isBackward) {
                 const [firstEvent] = await txn.timelineEvents.firstEvents(this._roomId, fragmentId, 1);
-                return new EventKey(firstEvent.fragmentId, firstEvent.eventIndex);
+                return firstEvent;
             } else {
                 const [lastEvent] = await txn.timelineEvents.lastEvents(this._roomId, fragmentId, 1);
-                return new EventKey(lastEvent.fragmentId, lastEvent.eventIndex);
+                return lastEvent;
             }
         }
 
@@ -1919,11 +1977,26 @@ var main = (function () {
 
         async _updateFragments(fragmentEntry, neighbourFragmentEntry, end, entries, txn) {
             const {direction} = fragmentEntry;
+            const changedFragments = [];
             directionalAppend(entries, fragmentEntry, direction);
             // set `end` as token, and if we found an event in the step before, link up the fragments in the fragment entry
             if (neighbourFragmentEntry) {
-                fragmentEntry.linkedFragmentId = neighbourFragmentEntry.fragmentId;
-                neighbourFragmentEntry.linkedFragmentId = fragmentEntry.fragmentId;
+                // the throws here should never happen and are only here to detect client or unhandled server bugs
+                // and a last measure to prevent corrupting fragment links
+                if (!fragmentEntry.hasLinkedFragment) {
+                    fragmentEntry.linkedFragmentId = neighbourFragmentEntry.fragmentId;
+                } else if (fragmentEntry.linkedFragmentId !== neighbourFragmentEntry.fragmentId) {
+                    throw new Error(`Prevented changing fragment ${fragmentEntry.fragmentId} ` +
+                        `${fragmentEntry.direction.asApiString()} link from ${fragmentEntry.linkedFragmentId} ` +
+                        `to ${neighbourFragmentEntry.fragmentId} in ${this._roomId}`);
+                }
+                if (!neighbourFragmentEntry.hasLinkedFragment) {
+                    neighbourFragmentEntry.linkedFragmentId = fragmentEntry.fragmentId;
+                } else if (neighbourFragmentEntry.linkedFragmentId !== fragmentEntry.fragmentId) {
+                    throw new Error(`Prevented changing fragment ${neighbourFragmentEntry.fragmentId} ` +
+                        `${neighbourFragmentEntry.direction.asApiString()} link from ${neighbourFragmentEntry.linkedFragmentId} ` +
+                        `to ${fragmentEntry.fragmentId} in ${this._roomId}`);
+                }
                 // if neighbourFragmentEntry was found, it means the events were overlapping,
                 // so no pagination should happen anymore.
                 neighbourFragmentEntry.token = null;
@@ -1932,13 +2005,16 @@ var main = (function () {
                 txn.timelineFragments.update(neighbourFragmentEntry.fragment);
                 directionalAppend(entries, neighbourFragmentEntry, direction);
 
-                // update fragmentIdComparer here after linking up fragments
-                this._fragmentIdComparer.add(fragmentEntry.fragment);
-                this._fragmentIdComparer.add(neighbourFragmentEntry.fragment);
+                // fragments that need to be changed in the fragmentIdComparer here
+                // after txn succeeds
+                changedFragments.push(fragmentEntry.fragment);
+                changedFragments.push(neighbourFragmentEntry.fragment);
             } else {
                 fragmentEntry.token = end;
             }
             txn.timelineFragments.update(fragmentEntry.fragment);
+
+            return changedFragments;
         }
 
         async writeFragmentFill(fragmentEntry, response, txn) {
@@ -1965,7 +2041,7 @@ var main = (function () {
                 throw new Error("start is not equal to prev_batch or next_batch");
             }
             // find last event in fragment so we get the eventIndex to begin creating keys at
-            let lastKey = await this._findLastFragmentEventKey(fragmentEntry, txn);
+            let lastKey = await this._findFragmentEdgeEventKey(fragmentEntry, txn);
             // find out if any event in chunk is already present using findFirstOrLastOccurringEventId
             const {
                 nonOverlappingEvents,
@@ -1974,9 +2050,9 @@ var main = (function () {
 
             // create entries for all events in chunk, add them to entries
             entries = this._storeEvents(nonOverlappingEvents, lastKey, direction, txn);
-            await this._updateFragments(fragmentEntry, neighbourFragmentEntry, end, entries, txn);
+            const fragments = await this._updateFragments(fragmentEntry, neighbourFragmentEntry, end, entries, txn);
         
-            return entries;
+            return {entries, fragments};
         }
     }
     //#endif
@@ -3216,7 +3292,7 @@ var main = (function () {
     	}
 
         sendEvent(eventType, content) {
-            this._sendQueue.enqueueEvent(eventType, content);
+            return this._sendQueue.enqueueEvent(eventType, content);
         }
 
 
@@ -3235,7 +3311,7 @@ var main = (function () {
                 this._storage.storeNames.timelineFragments,
             ]);
             let removedPendingEvents;
-            let newEntries;
+            let gapResult;
             try {
                 // detect remote echos of pending messages in the gap
                 removedPendingEvents = this._sendQueue.removeRemoteEchos(response.chunk, txn);
@@ -3245,18 +3321,21 @@ var main = (function () {
                     storage: this._storage,
                     fragmentIdComparer: this._fragmentIdComparer
                 });
-                newEntries = await gapWriter.writeFragmentFill(fragmentEntry, response, txn);
+                gapResult = await gapWriter.writeFragmentFill(fragmentEntry, response, txn);
             } catch (err) {
                 txn.abort();
                 throw err;
             }
             await txn.complete();
-            // once txn is committed, emit events
+            // once txn is committed, update in-memory state & emit events
+            for (const fragment of gapResult.fragments) {
+                this._fragmentIdComparer.add(fragment);
+            }
             if (removedPendingEvents) {
                 this._sendQueue.emitRemovals(removedPendingEvents);
             }
             if (this._timeline) {
-                this._timeline.addGapEntries(newEntries);
+                this._timeline.addGapEntries(gapResult.entries);
             }
         }
 
@@ -4142,21 +4221,38 @@ var main = (function () {
         }
 
         get announcement() {
-            const {sender, content, stateKey} = this._entry;
-            switch (content.membership) {
-                case "invite": return `${stateKey} was invited to the room by ${sender}`;
-                case "join": return `${stateKey} joined the room`;
-                case "leave": {
-                    if (stateKey === sender) {
-                        return `${stateKey} left the room`;
-                    } else {
-                        const reason = content.reason;
-                        return `${stateKey} was kicked from the room by ${sender}${reason ? `: ${reason}` : ""}`;
-                    }
+            const {sender, content, prevContent, stateKey} = this._entry;
+            const membership = content && content.membership;
+            const prevMembership = prevContent && prevContent.membership;
+
+            if (prevMembership === "join" && membership === "join") {
+                if (content.avatar_url !== prevContent.avatar_url) {
+                    return `${stateKey} changed their avatar`; 
+                } else if (content.displayname !== prevContent.displayname) {
+                    return `${stateKey} changed their name to ${content.displayname}`; 
                 }
-                case "ban": return `${stateKey} was banned from the room by ${sender}`;
-                default: return `${sender} membership changed to ${content.membership}`;
+            } else if (membership === "join") {
+                return `${stateKey} joined the room`;
+            } else if (membership === "invite") {
+                return `${stateKey} was invited to the room by ${sender}`;
+            } else if (prevMembership === "invite") {
+                if (membership === "join") {
+                    return `${stateKey} accepted the invitation to join the room`;
+                } else if (membership === "leave") {
+                    return `${stateKey} declined the invitation to join the room`;
+                }
+            } else if (membership === "leave") {
+                if (stateKey === sender) {
+                    return `${stateKey} left the room`;
+                } else {
+                    const reason = content.reason;
+                    return `${stateKey} was kicked from the room by ${sender}${reason ? `: ${reason}` : ""}`;
+                }
+            } else if (membership === "ban") {
+                return `${stateKey} was banned from the room by ${sender}`;
             }
+            
+            return `${sender} membership changed to ${content.membership}`;
         }
     }
 
@@ -4256,6 +4352,7 @@ var main = (function () {
             this._timelineVM = null;
             this._onRoomChange = this._onRoomChange.bind(this);
             this._timelineError = null;
+            this._sendError = null;
             this._closeCallback = closeCallback;
         }
 
@@ -4302,6 +4399,9 @@ var main = (function () {
             if (this._timelineError) {
                 return `Something went wrong loading the timeline: ${this._timelineError.message}`;
             }
+            if (this._sendError) {
+                return `Something went wrong sending your message: ${this._sendError.message}`;
+            }
             return "";
         }
 
@@ -4309,13 +4409,14 @@ var main = (function () {
             return avatarInitials(this._room.name);
         }
 
-        sendMessage(message) {
+        async sendMessage(message) {
             if (message) {
                 try {
-                    this._room.sendEvent("m.room.message", {msgtype: "m.text", body: message});
+                    await this._room.sendEvent("m.room.message", {msgtype: "m.text", body: message});
                 } catch (err) {
                     console.error(`room.sendMessage(): ${err.message}:\n${err.stack}`);
-                    this._timelineError = err;
+                    this._sendError = err;
+                    this._timelineError = null;
                     this.emit("change", "error");
                     return false;
                 }
