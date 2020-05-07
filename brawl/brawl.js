@@ -1,131 +1,33 @@
 var main = (function () {
     'use strict';
 
+    class AbortError extends Error {
+        get name() {
+            return "AbortError";
+        }
+    }
+
     class HomeServerError extends Error {
         constructor(method, url, body, status) {
             super(`${body ? body.error : status} on ${method} ${url}`);
             this.errcode = body ? body.errcode : null;
             this.retry_after_ms = body ? body.retry_after_ms : 0;
+            this.statusCode = status;
         }
 
-        get isFatal() {
-            switch (this.errcode) {
-                
-            }
-        }
-    }
-
-    class RequestAbortError extends Error {
-    }
-
-    class NetworkError extends Error { 
-    }
-
-    class RequestWrapper {
-        constructor(method, url, requestResult) {
-            this._requestResult = requestResult;
-            this._promise = this._requestResult.response().then(response => {
-                // ok?
-                if (response.status >= 200 && response.status < 300) {
-                    return response.body;
-                } else {
-                    switch (response.status) {
-                        default:
-                            throw new HomeServerError(method, url, response.body, response.status);
-                    }
-                }
-            });
-        }
-
-        abort() {
-            return this._requestResult.abort();
-        }
-
-        response() {
-            return this._promise;
+        get name() {
+            return "HomeServerError";
         }
     }
 
-    class HomeServerApi {
-        constructor({homeServer, accessToken, request}) {
-            // store these both in a closure somehow so it's harder to get at in case of XSS?
-            // one could change the homeserver as well so the token gets sent there, so both must be protected from read/write
-            this._homeserver = homeServer;
-            this._accessToken = accessToken;
-            this._requestFn = request;
+    class ConnectionError extends Error {
+        constructor(message, isTimeout) {
+            super(message || "ConnectionError");
+            this.isTimeout = isTimeout;
         }
 
-        _url(csPath) {
-            return `${this._homeserver}/_matrix/client/r0${csPath}`;
-        }
-
-        _request(method, csPath, queryParams = {}, body) {
-            const queryString = Object.entries(queryParams)
-                .filter(([, value]) => value !== undefined)
-                .map(([name, value]) => {
-                    if (typeof value === "object") {
-                        value = JSON.stringify(value);
-                    }
-                    return `${encodeURIComponent(name)}=${encodeURIComponent(value)}`;
-                })
-                .join("&");
-            const url = this._url(`${csPath}?${queryString}`);
-            let bodyString;
-            const headers = new Headers();
-            if (this._accessToken) {
-                headers.append("Authorization", `Bearer ${this._accessToken}`);
-            }
-            headers.append("Accept", "application/json");
-            if (body) {
-                headers.append("Content-Type", "application/json");
-                bodyString = JSON.stringify(body);
-            }
-            const requestResult = this._requestFn(url, {
-                method,
-                headers,
-                body: bodyString,
-            });
-            return new RequestWrapper(method, url, requestResult);
-        }
-
-        _post(csPath, queryParams, body) {
-            return this._request("POST", csPath, queryParams, body);
-        }
-
-        _put(csPath, queryParams, body) {
-            return this._request("PUT", csPath, queryParams, body);
-        }
-
-        _get(csPath, queryParams, body) {
-            return this._request("GET", csPath, queryParams, body);
-        }
-
-        sync(since, filter, timeout) {
-            return this._get("/sync", {since, timeout, filter});
-        }
-
-        // params is from, dir and optionally to, limit, filter.
-        messages(roomId, params) {
-            return this._get(`/rooms/${encodeURIComponent(roomId)}/messages`, params);
-        }
-
-        send(roomId, eventType, txnId, content) {
-            return this._put(`/rooms/${encodeURIComponent(roomId)}/send/${encodeURIComponent(eventType)}/${encodeURIComponent(txnId)}`, {}, content);
-        }
-
-        passwordLogin(username, password) {
-            return this._post("/login", undefined, {
-              "type": "m.login.password",
-              "identifier": {
-                "type": "m.id.user",
-                "user": username
-              },
-              "password": password
-            });
-        }
-
-        createFilter(userId, filter) {
-            return this._post(`/user/${encodeURIComponent(userId)}/filter`, undefined, filter);
+        get name() {
+            return "ConnectionError";
         }
     }
 
@@ -170,1145 +72,606 @@ var main = (function () {
             referrer: "no-referrer",
             cache: "no-cache",
         });
+        if (options.headers) {
+            const headers = new Headers();
+            for(const [name, value] of options.headers.entries()) {
+                headers.append(name, value);
+            }
+            options.headers = headers;
+        }
         const promise = fetch(url, options).then(async response => {
             const {status} = response;
             const body = await response.json();
             return {status, body};
         }, err => {
             if (err.name === "AbortError") {
-                throw new RequestAbortError();
+                throw new AbortError();
             } else if (err instanceof TypeError) {
                 // Network errors are reported as TypeErrors, see
                 // https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch#Checking_that_the_fetch_was_successful
                 // this can either mean user is offline, server is offline, or a CORS error (server misconfiguration).
                 // 
                 // One could check navigator.onLine to rule out the first
-                // but the 2 later ones are indistinguishable from javascript.
-                throw new NetworkError(`${options.method} ${url}: ${err.message}`);
+                // but the 2 latter ones are indistinguishable from javascript.
+                throw new ConnectionError(`${options.method} ${url}: ${err.message}`);
             }
             throw err;
         });
         return new RequestResult(promise, controller);
     }
 
-    const STORE_NAMES = Object.freeze([
-        "session",
-        "roomState",
-        "roomSummary",
-        "timelineEvents",
-        "timelineFragments",
-        "pendingEvents",
-    ]);
+    function createEnum(...values) {
+        const obj = {};
+        for (const value of values) {
+            obj[value] = value;
+        }
+        return Object.freeze(obj);
+    }
 
-    const STORE_MAP = Object.freeze(STORE_NAMES.reduce((nameMap, name) => {
-        nameMap[name] = name;
-        return nameMap;
-    }, {}));
+    class BaseObservable {
+        constructor() {
+            this._handlers = new Set();
+        }
 
-    class StorageError extends Error {
-        constructor(message, cause, value) {
-            let fullMessage = message;
-            if (cause) {
-                fullMessage += ": ";
-                if (typeof cause.name === "string") {
-                    fullMessage += `(name: ${cause.name}) `;
-                }
-                if (typeof cause.code === "number") {
-                    fullMessage += `(code: ${cause.name}) `;
-                }
-                fullMessage += cause.message;
+        onSubscribeFirst() {
+
+        }
+
+        onUnsubscribeLast() {
+
+        }
+
+        subscribe(handler) {
+            this._handlers.add(handler);
+            if (this._handlers.size === 1) {
+                this.onSubscribeFirst();
             }
-            super(fullMessage);
-            if (cause) {
-                this.errcode = cause.name;
+            return () => {
+                return this.unsubscribe(handler);
+            };
+        }
+
+        unsubscribe(handler) {
+            if (handler) {
+                this._handlers.delete(handler);
+                if (this._handlers.size === 0) {
+                    this.onUnsubscribeLast();
+                }
+                handler = null;
             }
-            this.cause = cause;
-            this.value = value;
+            return null;
+        }
+
+        // Add iterator over handlers here
+    }
+
+    // like an EventEmitter, but doesn't have an event type
+    class BaseObservableValue extends BaseObservable {
+        emit(argument) {
+            for (const h of this._handlers) {
+                h(argument);
+            }
+        }
+
+    }
+
+    class WaitForHandle {
+        constructor(observable, predicate) {
+            this._promise = new Promise((resolve, reject) => {
+                this._reject = reject;
+                this._subscription = observable.subscribe(v => {
+                    if (predicate(v)) {
+                        this._reject = null;
+                        resolve(v);
+                        this.dispose();
+                    }
+                });
+            });
+        }
+
+        get promise() {
+            return this._promise;
+        }
+
+        dispose() {
+            if (this._subscription) {
+                this._subscription();
+                this._subscription = null;
+            }
+            if (this._reject) {
+                this._reject(new AbortError());
+                this._reject = null;
+            }
         }
     }
 
-    // storage keys are defined to be unsigned 32bit numbers in WebPlatform.js, which is assumed by idb
-    function encodeUint32(n) {
-        const hex = n.toString(16);
-        return "0".repeat(8 - hex.length) + hex;
+    class ResolvedWaitForHandle {
+        constructor(promise) {
+            this.promise = promise;
+        }
+
+        dispose() {}
     }
 
-    function decodeUint32(str) {
-        return parseInt(str, 16);
+    class ObservableValue extends BaseObservableValue {
+        constructor(initialValue) {
+            super();
+            this._value = initialValue;
+        }
+
+        get() {
+            return this._value;
+        }
+
+        set(value) {
+            if (value !== this._value) {
+                this._value = value;
+                this.emit(this._value);
+            }
+        }
+
+        waitFor(predicate) {
+            if (predicate(this.get())) {
+                return new ResolvedWaitForHandle(Promise.resolve(this.get()));
+            } else {
+                return new WaitForHandle(this, predicate);
+            }
+        }
     }
 
-    function openDatabase(name, createObjectStore, version) {
-        const req = window.indexedDB.open(name, version);
-        req.onupgradeneeded = (ev) => {
-            const db = ev.target.result;
-            const oldVersion = ev.oldVersion;
-            createObjectStore(db, oldVersion, version);
-        }; 
-        return reqAsPromise(req);
-    }
-
-    function wrapError(err) {
-        return new StorageError(`wrapped DOMException`, err);
-    }
-
-    function reqAsPromise(req) {
-        return new Promise((resolve, reject) => {
-            req.addEventListener("success", event => resolve(event.target.result));
-            req.addEventListener("error", event => reject(wrapError(event.target.error)));
-        });
-    }
-
-    function txnAsPromise(txn) {
-        return new Promise((resolve, reject) => {
-            txn.addEventListener("complete", resolve);
-            txn.addEventListener("abort", event => reject(wrapError(event.target.error)));
-        });
-    }
-
-    function iterateCursor(cursorRequest, processValue) {
-        // TODO: does cursor already have a value here??
-        return new Promise((resolve, reject) => {
-            cursorRequest.onerror = () => {
-                reject(new StorageError("Query failed", cursorRequest.error));
-            };
-            // collect results
-            cursorRequest.onsuccess = (event) => {
-                const cursor = event.target.result;
-                if (!cursor) {
-                    resolve(false);
-                    return; // end of results
-                }
-                const {done, jumpTo} = processValue(cursor.value, cursor.key);
-                if (done) {
-                    resolve(true);
-                } else if(jumpTo) {
-                    cursor.continue(jumpTo);
+    class RequestWrapper {
+        constructor(method, url, requestResult, responsePromise) {
+            this._requestResult = requestResult;
+            this._promise = responsePromise.then(response => {
+                // ok?
+                if (response.status >= 200 && response.status < 300) {
+                    return response.body;
                 } else {
-                    cursor.continue();
-                }
-            };
-        }).catch(err => {
-            throw new StorageError("iterateCursor failed", err);
-        });
-    }
-
-    class QueryTarget {
-        constructor(target) {
-            this._target = target;
-        }
-
-        _openCursor(range, direction) {
-            if (range && direction) {
-                return this._target.openCursor(range, direction);
-            } else if (range) {
-                return this._target.openCursor(range);
-            } else if (direction) {
-                return this._target.openCursor(null, direction);
-            } else {
-                return this._target.openCursor();
-            }
-        }
-
-        supports(methodName) {
-            return this._target.supports(methodName);
-        }
-
-        get(key) {
-            return reqAsPromise(this._target.get(key));
-        }
-
-        getKey(key) {
-            return reqAsPromise(this._target.getKey(key));
-        }
-
-        reduce(range, reducer, initialValue) {
-            return this._reduce(range, reducer, initialValue, "next");
-        }
-
-        reduceReverse(range, reducer, initialValue) {
-            return this._reduce(range, reducer, initialValue, "prev");
-        }
-        
-        selectLimit(range, amount) {
-            return this._selectLimit(range, amount, "next");
-        }
-
-        selectLimitReverse(range, amount) {
-            return this._selectLimit(range, amount, "prev");
-        }
-
-        selectWhile(range, predicate) {
-            return this._selectWhile(range, predicate, "next");
-        }
-
-        selectWhileReverse(range, predicate) {
-            return this._selectWhile(range, predicate, "prev");
-        }
-
-        async selectAll(range, direction) {
-            const cursor = this._openCursor(range, direction);
-            const results = [];
-            await iterateCursor(cursor, (value) => {
-                results.push(value);
-                return {done: false};
-            });
-            return results;
-        }
-
-        selectFirst(range) {
-            return this._find(range, () => true, "next");
-        }
-
-        selectLast(range) {
-            return this._find(range, () => true, "prev");
-        }
-
-        find(range, predicate) {
-            return this._find(range, predicate, "next");
-        }
-
-        findReverse(range, predicate) {
-            return this._find(range, predicate, "prev");
-        }
-
-        async findMaxKey(range) {
-            const cursor = this._target.openKeyCursor(range, "prev");
-            let maxKey;
-            await iterateCursor(cursor, (_, key) => {
-                maxKey = key;
-                return {done: true};
-            });
-            return maxKey;
-        }
-
-        /**
-         * Checks if a given set of keys exist.
-         * Calls `callback(key, found)` for each key in `keys`, in key sorting order (or reversed if backwards=true).
-         * If the callback returns true, the search is halted and callback won't be called again.
-         * `callback` is called with the same instances of the key as given in `keys`, so direct comparison can be used.
-         */
-        async findExistingKeys(keys, backwards, callback) {
-            const direction = backwards ? "prev" : "next";
-            const compareKeys = (a, b) => backwards ? -indexedDB.cmp(a, b) : indexedDB.cmp(a, b);
-            const sortedKeys = keys.slice().sort(compareKeys);
-            const firstKey = backwards ? sortedKeys[sortedKeys.length - 1] : sortedKeys[0];
-            const lastKey = backwards ? sortedKeys[0] : sortedKeys[sortedKeys.length - 1];
-            const cursor = this._target.openKeyCursor(IDBKeyRange.bound(firstKey, lastKey), direction);
-            let i = 0;
-            let consumerDone = false;
-            await iterateCursor(cursor, (value, key) => {
-                // while key is larger than next key, advance and report false
-                while(i < sortedKeys.length && compareKeys(sortedKeys[i], key) < 0 && !consumerDone) {
-                    consumerDone = callback(sortedKeys[i], false);
-                    ++i;
-                }
-                if (i < sortedKeys.length && compareKeys(sortedKeys[i], key) === 0 && !consumerDone) {
-                    consumerDone = callback(sortedKeys[i], true);
-                    ++i;
-                }
-                const done = consumerDone || i >= sortedKeys.length;
-                const jumpTo = !done && sortedKeys[i];
-                return {done, jumpTo};
-            });
-            // report null for keys we didn't to at the end
-            while (!consumerDone && i < sortedKeys.length) {
-                consumerDone = callback(sortedKeys[i], false);
-                ++i;
-            }
-        }
-
-        _reduce(range, reducer, initialValue, direction) {
-            let reducedValue = initialValue;
-            const cursor = this._openCursor(range, direction);
-            return iterateCursor(cursor, (value) => {
-                reducedValue = reducer(reducedValue, value);
-                return {done: false};
-            });
-        }
-
-        _selectLimit(range, amount, direction) {
-            return this._selectWhile(range, (results) => {
-                return results.length === amount;
-            }, direction);
-        }
-
-        async _selectWhile(range, predicate, direction) {
-            const cursor = this._openCursor(range, direction);
-            const results = [];
-            await iterateCursor(cursor, (value) => {
-                results.push(value);
-                return {done: predicate(results)};
-            });
-            return results;
-        }
-
-        async _find(range, predicate, direction) {
-            const cursor = this._openCursor(range, direction);
-            let result;
-            const found = await iterateCursor(cursor, (value) => {
-                const found = predicate(value);
-                if (found) {
-                    result = value;
-                }
-                return {done: found};
-            });
-            if (found) {
-                return result;
-            }
-        }
-    }
-
-    class QueryTargetWrapper {
-        constructor(qt) {
-            this._qt = qt;
-        }
-
-        supports(methodName) {
-            return !!this._qt[methodName];
-        }
-        
-        openKeyCursor(...params) {
-            // not supported on Edge 15
-            if (!this._qt.openKeyCursor) {
-                return this.openCursor(...params);
-            }
-            try {
-                return this._qt.openKeyCursor(...params);
-            } catch(err) {
-                throw new StorageError("openKeyCursor failed", err);
-            }
-        }
-        
-        openCursor(...params) {
-            try {
-                return this._qt.openCursor(...params);
-            } catch(err) {
-                throw new StorageError("openCursor failed", err);
-            }
-        }
-
-        put(...params) {
-            try {
-                return this._qt.put(...params);
-            } catch(err) {
-                throw new StorageError("put failed", err);
-            }
-        }
-
-        add(...params) {
-            try {
-                return this._qt.add(...params);
-            } catch(err) {
-                throw new StorageError("add failed", err);
-            }
-        }
-
-        get(...params) {
-            try {
-                return this._qt.get(...params);
-            } catch(err) {
-                throw new StorageError("get failed", err);
-            }
-        }
-        
-        getKey(...params) {
-            try {
-                return this._qt.getKey(...params);
-            } catch(err) {
-                throw new StorageError("getKey failed", err);
-            }
-        }
-
-        delete(...params) {
-            try {
-                return this._qt.delete(...params);
-            } catch(err) {
-                throw new StorageError("delete failed", err);
-            }
-        }
-
-        index(...params) {
-            try {
-                return this._qt.index(...params);
-            } catch(err) {
-                throw new StorageError("index failed", err);
-            }
-        }
-    }
-
-    class Store extends QueryTarget {
-        constructor(idbStore) {
-            super(new QueryTargetWrapper(idbStore));
-        }
-
-        get _idbStore() {
-            return this._target;
-        }
-
-        index(indexName) {
-            return new QueryTarget(new QueryTargetWrapper(this._idbStore.index(indexName)));
-        }
-
-        async put(value) {
-            try {
-                return await reqAsPromise(this._idbStore.put(value));
-            } catch(err) {
-                const originalErr = err.cause;
-                throw new StorageError(`put on ${this._idbStore.name} failed`, originalErr, value);
-            }
-        }
-
-        async add(value) {
-            try {
-                return await reqAsPromise(this._idbStore.add(value));
-            } catch(err) {
-                const originalErr = err.cause;
-                throw new StorageError(`add on ${this._idbStore.name} failed`, originalErr, value);
-            }
-        }
-
-        delete(keyOrKeyRange) {
-            return reqAsPromise(this._idbStore.delete(keyOrKeyRange));
-        }
-    }
-
-    /**
-    store contains:
-    	loginData {
-    		device_id
-    		home_server
-    		access_token
-    		user_id
-    	}
-    	// flags {
-    	// 	lazyLoading?
-    	// }
-    	syncToken
-    	displayName
-    	avatarUrl
-    	lastSynced
-    */
-    class SessionStore {
-    	constructor(sessionStore) {
-    		this._sessionStore = sessionStore;
-    	}
-
-    	async get() {
-    		const session = await this._sessionStore.selectFirst(IDBKeyRange.only(1));
-    		if (session) {
-    			return session.value;
-    		}
-    	}
-
-    	set(session) {
-    		return this._sessionStore.put({key: 1, value: session});
-    	}
-    }
-
-    /**
-    store contains:
-    	roomId
-    	name
-    	lastMessage
-    	unreadCount
-    	mentionCount
-    	isEncrypted
-    	isDirectMessage
-    	membership
-    	inviteCount
-    	joinCount
-    */
-    class RoomSummaryStore {
-    	constructor(summaryStore) {
-    		this._summaryStore = summaryStore;
-    	}
-
-    	getAll() {
-    		return this._summaryStore.selectAll();
-    	}
-
-    	set(summary) {
-    		return this._summaryStore.put(summary);
-    	}
-    }
-
-    var Platform = {
-        get minStorageKey() {
-            // for indexeddb, we use unsigned 32 bit integers as keys
-            return 0;
-        },
-        
-        get middleStorageKey() {
-            // for indexeddb, we use unsigned 32 bit integers as keys
-            return 0x7FFFFFFF;
-        },
-
-        get maxStorageKey() {
-            // for indexeddb, we use unsigned 32 bit integers as keys
-            return 0xFFFFFFFF;
-        },
-
-        delay(ms) {
-            return new Promise(resolve => setTimeout(resolve, ms));
-        }
-    };
-
-    // key for events in the timelineEvents store
-    class EventKey {
-        constructor(fragmentId, eventIndex) {
-            this.fragmentId = fragmentId;
-            this.eventIndex = eventIndex;
-        }
-
-        nextFragmentKey() {
-            // could take MIN_EVENT_INDEX here if it can't be paged back
-            return new EventKey(this.fragmentId + 1, Platform.middleStorageKey);
-        }
-
-        nextKeyForDirection(direction) {
-            if (direction.isForward) {
-                return this.nextKey();
-            } else {
-                return this.previousKey();
-            }
-        }
-
-        previousKey() {
-            return new EventKey(this.fragmentId, this.eventIndex - 1);
-        }
-
-        nextKey() {
-            return new EventKey(this.fragmentId, this.eventIndex + 1);
-        }
-
-        static get maxKey() {
-            return new EventKey(Platform.maxStorageKey, Platform.maxStorageKey);
-        }
-
-        static get minKey() {
-            return new EventKey(Platform.minStorageKey, Platform.minStorageKey);
-        }
-
-        static get defaultLiveKey() {
-            return EventKey.defaultFragmentKey(Platform.minStorageKey);
-        }
-
-        static defaultFragmentKey(fragmentId) {
-            return new EventKey(fragmentId, Platform.middleStorageKey);
-        }
-
-        toString() {
-            return `[${this.fragmentId}/${this.eventIndex}]`;
-        }
-    }
-    //#endif
-
-    function encodeKey(roomId, fragmentId, eventIndex) {
-        return `${roomId}|${encodeUint32(fragmentId)}|${encodeUint32(eventIndex)}`;
-    }
-
-    function encodeEventIdKey(roomId, eventId) {
-        return `${roomId}|${eventId}`;
-    }
-
-    function decodeEventIdKey(eventIdKey) {
-        const [roomId, eventId] = eventIdKey.split("|");
-        return {roomId, eventId};
-    }
-
-    class Range {
-        constructor(only, lower, upper, lowerOpen, upperOpen) {
-            this._only = only;
-            this._lower = lower;
-            this._upper = upper;
-            this._lowerOpen = lowerOpen;
-            this._upperOpen = upperOpen;
-        }
-
-        asIDBKeyRange(roomId) {
-            try {
-                // only
-                if (this._only) {
-                    return IDBKeyRange.only(encodeKey(roomId, this._only.fragmentId, this._only.eventIndex));
-                }
-                // lowerBound
-                // also bound as we don't want to move into another roomId
-                if (this._lower && !this._upper) {
-                    return IDBKeyRange.bound(
-                        encodeKey(roomId, this._lower.fragmentId, this._lower.eventIndex),
-                        encodeKey(roomId, this._lower.fragmentId, Platform.maxStorageKey),
-                        this._lowerOpen,
-                        false
-                    );
-                }
-                // upperBound
-                // also bound as we don't want to move into another roomId
-                if (!this._lower && this._upper) {
-                    return IDBKeyRange.bound(
-                        encodeKey(roomId, this._upper.fragmentId, Platform.minStorageKey),
-                        encodeKey(roomId, this._upper.fragmentId, this._upper.eventIndex),
-                        false,
-                        this._upperOpen
-                    );
-                }
-                // bound
-                if (this._lower && this._upper) {
-                    return IDBKeyRange.bound(
-                        encodeKey(roomId, this._lower.fragmentId, this._lower.eventIndex),
-                        encodeKey(roomId, this._upper.fragmentId, this._upper.eventIndex),
-                        this._lowerOpen,
-                        this._upperOpen
-                    );
-                }
-            } catch(err) {
-                throw new StorageError(`IDBKeyRange failed with data: ` + JSON.stringify(this), err);
-            }
-        }
-    }
-    /*
-     * @typedef   {Object} Gap
-     * @property  {?string} prev_batch the pagination token for this backwards facing gap
-     * @property  {?string} next_batch the pagination token for this forwards facing gap
-     *
-     * @typedef   {Object} Event
-     * @property  {string} event_id the id of the event
-     * @property  {string} type the
-     * @property  {?string} state_key the state key of this state event
-     *
-     * @typedef   {Object} Entry
-     * @property  {string} roomId
-     * @property  {EventKey} eventKey
-     * @property  {?Event} event if an event entry, the event
-     * @property  {?Gap} gap if a gap entry, the gap
-    */
-    class TimelineEventStore {
-        constructor(timelineStore) {
-            this._timelineStore = timelineStore;
-        }
-
-        /** Creates a range that only includes the given key
-         *  @param {EventKey} eventKey the key
-         *  @return {Range} the created range
-         */
-        onlyRange(eventKey) {
-            return new Range(eventKey);
-        }
-
-        /** Creates a range that includes all keys before eventKey, and optionally also the key itself.
-         *  @param {EventKey} eventKey the key
-         *  @param {boolean} [open=false] whether the key is included (false) or excluded (true) from the range at the upper end.
-         *  @return {Range} the created range
-         */
-        upperBoundRange(eventKey, open=false) {
-            return new Range(undefined, undefined, eventKey, undefined, open);
-        }
-
-        /** Creates a range that includes all keys after eventKey, and optionally also the key itself.
-         *  @param {EventKey} eventKey the key
-         *  @param {boolean} [open=false] whether the key is included (false) or excluded (true) from the range at the lower end.
-         *  @return {Range} the created range
-         */
-        lowerBoundRange(eventKey, open=false) {
-            return new Range(undefined, eventKey, undefined, open);
-        }
-
-        /** Creates a range that includes all keys between `lower` and `upper`, and optionally the given keys as well.
-         *  @param {EventKey} lower the lower key
-         *  @param {EventKey} upper the upper key
-         *  @param {boolean} [lowerOpen=false] whether the lower key is included (false) or excluded (true) from the range.
-         *  @param {boolean} [upperOpen=false] whether the upper key is included (false) or excluded (true) from the range.
-         *  @return {Range} the created range
-         */
-        boundRange(lower, upper, lowerOpen=false, upperOpen=false) {
-            return new Range(undefined, lower, upper, lowerOpen, upperOpen);
-        }
-
-        /** Looks up the last `amount` entries in the timeline for `roomId`.
-         *  @param  {string} roomId
-         *  @param  {number} fragmentId
-         *  @param  {number} amount
-         *  @return {Promise<Entry[]>} a promise resolving to an array with 0 or more entries, in ascending order.
-         */
-        async lastEvents(roomId, fragmentId, amount) {
-            const eventKey = EventKey.maxKey;
-            eventKey.fragmentId = fragmentId;
-            return this.eventsBefore(roomId, eventKey, amount);
-        }
-
-        /** Looks up the first `amount` entries in the timeline for `roomId`.
-         *  @param  {string} roomId
-         *  @param  {number} fragmentId
-         *  @param  {number} amount
-         *  @return {Promise<Entry[]>} a promise resolving to an array with 0 or more entries, in ascending order.
-         */
-        async firstEvents(roomId, fragmentId, amount) {
-            const eventKey = EventKey.minKey;
-            eventKey.fragmentId = fragmentId;
-            return this.eventsAfter(roomId, eventKey, amount);
-        }
-
-        /** Looks up `amount` entries after `eventKey` in the timeline for `roomId` within the same fragment.
-         *  The entry for `eventKey` is not included.
-         *  @param  {string} roomId
-         *  @param  {EventKey} eventKey
-         *  @param  {number} amount
-         *  @return {Promise<Entry[]>} a promise resolving to an array with 0 or more entries, in ascending order.
-         */
-        eventsAfter(roomId, eventKey, amount) {
-            const idbRange = this.lowerBoundRange(eventKey, true).asIDBKeyRange(roomId);
-            return this._timelineStore.selectLimit(idbRange, amount);
-        }
-
-        /** Looks up `amount` entries before `eventKey` in the timeline for `roomId` within the same fragment.
-         *  The entry for `eventKey` is not included.
-         *  @param  {string} roomId
-         *  @param  {EventKey} eventKey
-         *  @param  {number} amount
-         *  @return {Promise<Entry[]>} a promise resolving to an array with 0 or more entries, in ascending order.
-         */
-        async eventsBefore(roomId, eventKey, amount) {
-            const range = this.upperBoundRange(eventKey, true).asIDBKeyRange(roomId);
-            const events = await this._timelineStore.selectLimitReverse(range, amount);
-            events.reverse(); // because we fetched them backwards
-            return events;
-        }
-
-        /** Finds the first eventId that occurs in the store, if any.
-         *  For optimal performance, `eventIds` should be in chronological order.
-         *
-         *  The order in which results are returned might be different than `eventIds`.
-         *  Call the return value to obtain the next {id, event} pair.
-         *  @param  {string} roomId
-         *  @param  {string[]} eventIds
-         *  @return {Function<Promise>}
-         */
-        // performance comment from above refers to the fact that there *might*
-        // be a correlation between event_id sorting order and chronology.
-        // In that case we could avoid running over all eventIds, as the reported order by findExistingKeys
-        // would match the order of eventIds. That's why findLast is also passed as backwards to keysExist.
-        // also passing them in chronological order makes sense as that's how we'll receive them almost always.
-        async findFirstOccurringEventId(roomId, eventIds) {
-            const byEventId = this._timelineStore.index("byEventId");
-            const keys = eventIds.map(eventId => encodeEventIdKey(roomId, eventId));
-            const results = new Array(keys.length);
-            let firstFoundKey;
-
-            // find first result that is found and has no undefined results before it
-            function firstFoundAndPrecedingResolved() {
-                for(let i = 0; i < results.length; ++i) {
-                    if (results[i] === undefined) {
-                        return;
-                    } else if(results[i] === true) {
-                        return keys[i];
+                    switch (response.status) {
+                        default:
+                            throw new HomeServerError(method, url, response.body, response.status);
                     }
                 }
-            }
-
-            await byEventId.findExistingKeys(keys, false, (key, found) => {
-                const index = keys.indexOf(key);
-                results[index] = found;
-                firstFoundKey = firstFoundAndPrecedingResolved();
-                return !!firstFoundKey;
             });
-            return firstFoundKey && decodeEventIdKey(firstFoundKey).eventId;
-        }
-
-        /** Inserts a new entry into the store. The combination of roomId and eventKey should not exist yet, or an error is thrown.
-         *  @param  {Entry} entry the entry to insert
-         *  @return {Promise<>} a promise resolving to undefined if the operation was successful, or a StorageError if not.
-         *  @throws {StorageError} ...
-         */
-        insert(entry) {
-            entry.key = encodeKey(entry.roomId, entry.fragmentId, entry.eventIndex);
-            entry.eventIdKey = encodeEventIdKey(entry.roomId, entry.event.event_id);
-            // TODO: map error? or in idb/store?
-            return this._timelineStore.add(entry);
-        }
-
-        /** Updates the entry into the store with the given [roomId, eventKey] combination.
-         *  If not yet present, will insert. Might be slower than add.
-         *  @param  {Entry} entry the entry to update.
-         *  @return {Promise<>} a promise resolving to undefined if the operation was successful, or a StorageError if not.
-         */
-        update(entry) {
-            return this._timelineStore.put(entry);
-        }
-
-        get(roomId, eventKey) {
-            return this._timelineStore.get(encodeKey(roomId, eventKey.fragmentId, eventKey.eventIndex));
-        }
-        // returns the entries as well!! (or not always needed? I guess not always needed, so extra method)
-        removeRange(roomId, range) {
-            // TODO: read the entries!
-            return this._timelineStore.delete(range.asIDBKeyRange(roomId));
-        }
-
-        getByEventId(roomId, eventId) {
-            return this._timelineStore.index("byEventId").get(encodeEventIdKey(roomId, eventId));
-        }
-    }
-
-    class RoomStateStore {
-    	constructor(idbStore) {
-    		this._roomStateStore = idbStore;
-    	}
-
-    	async getEvents(type) {
-
-    	}
-
-    	async getEventsForKey(type, stateKey) {
-
-    	}
-
-    	async setStateEvent(roomId, event) {
-            const key = `${roomId}|${event.type}|${event.state_key}`;
-            const entry = {roomId, event, key};
-    		return this._roomStateStore.put(entry);
-    	}
-    }
-
-    function encodeKey$1(roomId, fragmentId) {
-        return `${roomId}|${encodeUint32(fragmentId)}`;
-    }
-
-    class RoomFragmentStore {
-        constructor(store) {
-            this._store = store;
-        }
-
-        _allRange(roomId) {
-            try {
-                return IDBKeyRange.bound(
-                    encodeKey$1(roomId, Platform.minStorageKey),
-                    encodeKey$1(roomId, Platform.maxStorageKey)
-                );
-            } catch (err) {
-                throw new StorageError(`error from IDBKeyRange with roomId ${roomId}`, err);
-            }
-        }
-
-        all(roomId) {
-            return this._store.selectAll(this._allRange(roomId));
-        }
-
-        /** Returns the fragment without a nextToken and without nextId,
-        if any, with the largest id if there are multiple (which should not happen) */
-        liveFragment(roomId) {
-            // why do we need this?
-            // Ok, take the case where you've got a /context fragment and a /sync fragment
-            // They are not connected. So, upon loading the persister, which one do we take? We can't sort them ...
-            // we assume that the one without a nextToken and without a nextId is a live one
-            // there should really be only one like this
-
-            // reverse because assuming live fragment has bigger id than non-live ones
-            return this._store.findReverse(this._allRange(roomId), fragment => {
-                return typeof fragment.nextId !== "number" && typeof fragment.nextToken !== "string";
-            });
-        }
-
-        // should generate an id an return it?
-        // depends if we want to do anything smart with fragment ids,
-        // like give them meaning depending on range. not for now probably ...
-        add(fragment) {
-            fragment.key = encodeKey$1(fragment.roomId, fragment.id);
-            return this._store.add(fragment);
-        }
-
-        update(fragment) {
-            return this._store.put(fragment);
-        }
-
-        get(roomId, fragmentId) {
-            return this._store.get(encodeKey$1(roomId, fragmentId));
-        }
-    }
-
-    function encodeKey$2(roomId, queueIndex) {
-        return `${roomId}|${encodeUint32(queueIndex)}`;
-    }
-
-    function decodeKey(key) {
-        const [roomId, encodedQueueIndex] = key.split("|");
-        const queueIndex = decodeUint32(encodedQueueIndex);
-        return {roomId, queueIndex};
-    }
-
-    class PendingEventStore {
-        constructor(eventStore) {
-            this._eventStore = eventStore;
-        }
-
-        async getMaxQueueIndex(roomId) {
-            const range = IDBKeyRange.bound(
-                encodeKey$2(roomId, Platform.minStorageKey),
-                encodeKey$2(roomId, Platform.maxStorageKey),
-                false,
-                false,
-            );
-            const maxKey = await this._eventStore.findMaxKey(range);
-            if (maxKey) {
-                return decodeKey(maxKey).queueIndex;
-            }
-        }
-
-        remove(roomId, queueIndex) {
-            const keyRange = IDBKeyRange.only(encodeKey$2(roomId, queueIndex));
-            this._eventStore.delete(keyRange);
-        }
-
-        async exists(roomId, queueIndex) {
-            const keyRange = IDBKeyRange.only(encodeKey$2(roomId, queueIndex));
-            let key;
-            if (this._eventStore.supports("getKey")) {
-                key = await this._eventStore.getKey(keyRange);
-            } else {
-                const value = await this._eventStore.get(keyRange);
-                key = value && value.key;
-            }
-            return !!key;
-        }
-        
-        add(pendingEvent) {
-            pendingEvent.key = encodeKey$2(pendingEvent.roomId, pendingEvent.queueIndex);
-            return this._eventStore.add(pendingEvent);
-        }
-
-        update(pendingEvent) {
-            return this._eventStore.put(pendingEvent);
-        }
-
-        getAll() {
-            return this._eventStore.selectAll();
-        }
-    }
-
-    class Transaction {
-        constructor(txn, allowedStoreNames) {
-            this._txn = txn;
-            this._allowedStoreNames = allowedStoreNames;
-            this._stores = {
-                session: null,
-                roomSummary: null,
-                roomTimeline: null,
-                roomState: null,
-            };
-        }
-
-        _idbStore(name) {
-            if (!this._allowedStoreNames.includes(name)) {
-                // more specific error? this is a bug, so maybe not ...
-                throw new StorageError(`Invalid store for transaction: ${name}, only ${this._allowedStoreNames.join(", ")} are allowed.`);
-            }
-            return new Store(this._txn.objectStore(name));
-        }
-
-        _store(name, mapStore) {
-            if (!this._stores[name]) {
-                const idbStore = this._idbStore(name);
-                this._stores[name] = mapStore(idbStore);
-            }
-            return this._stores[name];
-        }
-
-        get session() {
-            return this._store("session", idbStore => new SessionStore(idbStore));
-        }
-
-        get roomSummary() {
-            return this._store("roomSummary", idbStore => new RoomSummaryStore(idbStore));
-        }
-
-        get timelineFragments() {
-            return this._store("timelineFragments", idbStore => new RoomFragmentStore(idbStore));
-        }
-
-        get timelineEvents() {
-            return this._store("timelineEvents", idbStore => new TimelineEventStore(idbStore));
-        }
-
-        get roomState() {
-            return this._store("roomState", idbStore => new RoomStateStore(idbStore));
-        }
-
-        get pendingEvents() {
-            return this._store("pendingEvents", idbStore => new PendingEventStore(idbStore));
-        }
-
-        complete() {
-            return txnAsPromise(this._txn);
         }
 
         abort() {
-            this._txn.abort();
+            return this._requestResult.abort();
+        }
+
+        response() {
+            return this._promise;
         }
     }
 
-    class Storage {
-        constructor(idbDatabase) {
-            this._db = idbDatabase;
-            const nameMap = STORE_NAMES.reduce((nameMap, name) => {
-                nameMap[name] = name;
-                return nameMap;
-            }, {});
-            this.storeNames = Object.freeze(nameMap);
+    class HomeServerApi {
+        constructor({homeServer, accessToken, request, createTimeout, reconnector}) {
+            // store these both in a closure somehow so it's harder to get at in case of XSS?
+            // one could change the homeserver as well so the token gets sent there, so both must be protected from read/write
+            this._homeserver = homeServer;
+            this._accessToken = accessToken;
+            this._requestFn = request;
+            this._createTimeout = createTimeout;
+            this._reconnector = reconnector;
         }
 
-        _validateStoreNames(storeNames) {
-            const idx = storeNames.findIndex(name => !STORE_NAMES.includes(name));
-            if (idx !== -1) {
-                throw new StorageError(`Tried top, a transaction unknown store ${storeNames[idx]}`);
+        _url(csPath) {
+            return `${this._homeserver}/_matrix/client/r0${csPath}`;
+        }
+
+        _abortOnTimeout(timeoutAmount, requestResult, responsePromise) {
+            const timeout = this._createTimeout(timeoutAmount);
+            // abort request if timeout finishes first
+            let timedOut = false;
+            timeout.elapsed().then(
+                () => {
+                    timedOut = true;
+                    requestResult.abort();
+                },
+                () => {}    // ignore AbortError
+            );
+            // abort timeout if request finishes first
+            return responsePromise.then(
+                response => {
+                    timeout.abort();
+                    return response;
+                },
+                err => {
+                    timeout.abort();
+                    // map error to TimeoutError
+                    if (err instanceof AbortError && timedOut) {
+                        throw new ConnectionError(`Request timed out after ${timeoutAmount}ms`, true);
+                    } else {
+                        throw err;
+                    }
+                }
+            );
+        }
+
+        _request(method, url, queryParams, body, options) {
+            const queryString = Object.entries(queryParams || {})
+                .filter(([, value]) => value !== undefined)
+                .map(([name, value]) => {
+                    if (typeof value === "object") {
+                        value = JSON.stringify(value);
+                    }
+                    return `${encodeURIComponent(name)}=${encodeURIComponent(value)}`;
+                })
+                .join("&");
+            url = `${url}?${queryString}`;
+            let bodyString;
+            const headers = new Map();
+            if (this._accessToken) {
+                headers.set("Authorization", `Bearer ${this._accessToken}`);
             }
-        }
-
-        async readTxn(storeNames) {
-            this._validateStoreNames(storeNames);
-            try {
-                const txn = this._db.transaction(storeNames, "readonly");
-                return new Transaction(txn, storeNames);
-            } catch(err) {
-                throw new StorageError("readTxn failed", err);
+            headers.set("Accept", "application/json");
+            if (body) {
+                headers.set("Content-Type", "application/json");
+                bodyString = JSON.stringify(body);
             }
-        }
-
-        async readWriteTxn(storeNames) {
-            this._validateStoreNames(storeNames);
-            try {
-                const txn = this._db.transaction(storeNames, "readwrite");
-                return new Transaction(txn, storeNames);
-            } catch(err) {
-                throw new StorageError("readWriteTxn failed", err);
-            }
-        }
-    }
-
-    async function exportSession(db) {
-        const NOT_DONE = {done: false};
-        const txn = db.transaction(STORE_NAMES, "readonly");
-        const data = {};
-        await Promise.all(STORE_NAMES.map(async name => {
-            const results = data[name] = [];  // initialize in deterministic order
-            const store = txn.objectStore(name);
-            await iterateCursor(store.openCursor(), (value) => {
-                results.push(value);
-                return NOT_DONE;
+            const requestResult = this._requestFn(url, {
+                method,
+                headers,
+                body: bodyString,
             });
-        }));
-        return data;
+
+            let responsePromise = requestResult.response();
+
+            if (options && options.timeout) {
+                responsePromise = this._abortOnTimeout(
+                    options.timeout,
+                    requestResult,
+                    responsePromise
+                );
+            }
+
+            const wrapper = new RequestWrapper(method, url, requestResult, responsePromise);
+            
+            if (this._reconnector) {
+                wrapper.response().catch(err => {
+                    if (err.name === "ConnectionError") {
+                        this._reconnector.onRequestFailed(this);
+                    }
+                });
+            }
+
+            return wrapper;
+        }
+
+        _post(csPath, queryParams, body, options) {
+            return this._request("POST", this._url(csPath), queryParams, body, options);
+        }
+
+        _put(csPath, queryParams, body, options) {
+            return this._request("PUT", this._url(csPath), queryParams, body, options);
+        }
+
+        _get(csPath, queryParams, body, options) {
+            return this._request("GET", this._url(csPath), queryParams, body, options);
+        }
+
+        sync(since, filter, timeout, options = null) {
+            return this._get("/sync", {since, timeout, filter}, null, options);
+        }
+
+        // params is from, dir and optionally to, limit, filter.
+        messages(roomId, params, options = null) {
+            return this._get(`/rooms/${encodeURIComponent(roomId)}/messages`, params, null, options);
+        }
+
+        send(roomId, eventType, txnId, content, options = null) {
+            return this._put(`/rooms/${encodeURIComponent(roomId)}/send/${encodeURIComponent(eventType)}/${encodeURIComponent(txnId)}`, {}, content, options);
+        }
+
+        passwordLogin(username, password, options = null) {
+            return this._post("/login", null, {
+              "type": "m.login.password",
+              "identifier": {
+                "type": "m.id.user",
+                "user": username
+              },
+              "password": password
+            }, options);
+        }
+
+        createFilter(userId, filter, options = null) {
+            return this._post(`/user/${encodeURIComponent(userId)}/filter`, null, filter, options);
+        }
+
+        versions(options = null) {
+            return this._request("GET", `${this._homeserver}/_matrix/client/versions`, null, null, options);
+        }
     }
 
-    async function importSession(db, data) {
-        const txn = db.transaction(STORE_NAMES, "readwrite");
-        for (const name of STORE_NAMES) {
-            const store = txn.objectStore(name);
-            for (const value of data[name]) {
-                store.add(value);
+    class ExponentialRetryDelay {
+        constructor(createTimeout) {
+            const start = 2000;
+            this._start = start;
+            this._current = start;
+            this._createTimeout = createTimeout;
+            this._max = 60 * 5 * 1000; //5 min
+            this._timeout = null;
+        }
+
+        async waitForRetry() {
+            this._timeout = this._createTimeout(this._current);
+            try {
+                await this._timeout.elapsed();
+                // only increase delay if we didn't get interrupted
+                const next = 2 * this._current;
+                this._current = Math.min(this._max, next);
+            } catch(err) {
+                // swallow AbortError, means abort was called
+                if (!(err instanceof AbortError)) {
+                    throw err;
+                }
+            } finally {
+                this._timeout = null;
             }
         }
-        await txnAsPromise(txn);
-    }
 
-    const sessionName = sessionId => `brawl_session_${sessionId}`;
-    const openDatabaseWithSessionId = sessionId => openDatabase(sessionName(sessionId), createStores, 1);
-
-    class StorageFactory {
-        async create(sessionId) {
-            const db = await openDatabaseWithSessionId(sessionId);
-            return new Storage(db);
+        abort() {
+            if (this._timeout) {
+                this._timeout.abort();
+            }
         }
 
-        delete(sessionId) {
-            const databaseName = sessionName(sessionId);
-            const req = window.indexedDB.deleteDatabase(databaseName);
-            return reqAsPromise(req);
+        reset() {
+            this._current = this._start;
+            this.abort();
         }
 
-        async export(sessionId) {
-            const db = await openDatabaseWithSessionId(sessionId);
-            return await exportSession(db);
-        }
-
-        async import(sessionId, data) {
-            const db = await openDatabaseWithSessionId(sessionId);
-            return await importSession(db, data);
+        get nextValue() {
+            return this._current;
         }
     }
 
-    function createStores(db) {
-        db.createObjectStore("session", {keyPath: "key"});
-        // any way to make keys unique here? (just use put?)
-        db.createObjectStore("roomSummary", {keyPath: "roomId"});
+    const ConnectionStatus = createEnum(
+        "Waiting",
+        "Reconnecting",
+        "Online"
+    );
 
-        // need index to find live fragment? prooobably ok without for now
-        //key = room_id | fragment_id
-        db.createObjectStore("timelineFragments", {keyPath: "key"});
-        //key = room_id | fragment_id | event_index
-        const timelineEvents = db.createObjectStore("timelineEvents", {keyPath: "key"});
-        //eventIdKey = room_id | event_id
-        timelineEvents.createIndex("byEventId", "eventIdKey", {unique: true});
-        //key = room_id | event.type | event.state_key,
-        db.createObjectStore("roomState", {keyPath: "key"});
-        db.createObjectStore("pendingEvents", {keyPath: "key"});
-        
-        // const roomMembers = db.createObjectStore("roomMembers", {keyPath: [
-        //  "event.room_id",
-        //  "event.content.membership",
-        //  "event.state_key"
-        // ]});
-        // roomMembers.createIndex("byName", ["room_id", "content.name"]);
-    }
-
-    class SessionsStore {
-        constructor(name) {
-            this._name = name;
+    class Reconnector {
+        constructor({retryDelay, createMeasure, onlineStatus}) {
+            this._onlineStatus = onlineStatus;
+            this._retryDelay = retryDelay;
+            this._createTimeMeasure = createMeasure;
+            // assume online, and do our thing when something fails
+            this._state = new ObservableValue(ConnectionStatus.Online);
+            this._isReconnecting = false;
+            this._versionsResponse = null;
         }
 
-        getAll() {
-            const sessionsJson = localStorage.getItem(this._name);
-            if (sessionsJson) {
-                const sessions = JSON.parse(sessionsJson);
-                if (Array.isArray(sessions)) {
-                    return Promise.resolve(sessions);
+        get lastVersionsResponse() {
+            return this._versionsResponse;
+        }
+
+        get connectionStatus() {
+            return this._state;
+        }
+
+        get retryIn() {
+            if (this._state.get() === ConnectionStatus.Waiting) {
+                return this._retryDelay.nextValue - this._stateSince.measure();
+            }
+            return 0;
+        }
+
+        async onRequestFailed(hsApi) {
+            if (!this._isReconnecting) {  
+                this._isReconnecting = true;
+     
+                const onlineStatusSubscription = this._onlineStatus && this._onlineStatus.subscribe(online => {
+                    if (online) {
+                        this.tryNow();
+                    }
+                });
+
+                try {
+                    await this._reconnectLoop(hsApi);
+                } catch (err) {
+                    // nothing is catching the error above us,
+                    // so just log here
+                    console.error(err);
+                } finally {
+                    if (onlineStatusSubscription) {
+                        // unsubscribe from this._onlineStatus
+                        onlineStatusSubscription();
+                    }
+                    this._isReconnecting = false;
                 }
             }
-            return Promise.resolve([]);
         }
 
-        async hasAnySession() {
-            const all = await this.getAll();
-            return all && all.length > 0;
+        tryNow() {
+            if (this._retryDelay) {
+                // this will interrupt this._retryDelay.waitForRetry() in _reconnectLoop
+                this._retryDelay.abort();
+            }
         }
 
-        async updateLastUsed(id, timestamp) {
-            const sessions = await this.getAll();
-            if (sessions) {
-                const session = sessions.find(session => session.id === id);
-                if (session) {
-                    session.lastUsed = timestamp;
-                    localStorage.setItem(this._name, JSON.stringify(sessions));
+        _setState(state) {
+            if (state !== this._state.get()) {
+                if (state === ConnectionStatus.Waiting) {
+                    this._stateSince = this._createTimeMeasure();
+                } else {
+                    this._stateSince = null;
+                }
+                this._state.set(state);
+            }
+        }
+        
+        async _reconnectLoop(hsApi) {
+            this._versionsResponse = null;
+            this._retryDelay.reset();
+
+            while (!this._versionsResponse) {
+                try {
+                    this._setState(ConnectionStatus.Reconnecting);
+                    // use 30s timeout, as a tradeoff between not giving up
+                    // too quickly on a slow server, and not waiting for
+                    // a stale connection when we just came online again
+                    const versionsRequest = hsApi.versions({timeout: 30000});
+                    this._versionsResponse = await versionsRequest.response();
+                    this._setState(ConnectionStatus.Online);
+                } catch (err) {
+                    if (err.name === "ConnectionError") {
+                        this._setState(ConnectionStatus.Waiting);
+                        await this._retryDelay.waitForRetry();
+                    } else {
+                        throw err;
+                    }
+                }
+            }
+        }
+    }
+
+    const INCREMENTAL_TIMEOUT = 30000;
+
+    const SyncStatus = createEnum(
+        "InitialSync",
+        "CatchupSync",
+        "Syncing",
+        "Stopped"
+    );
+
+    function parseRooms(roomsSection, roomCallback) {
+        if (roomsSection) {
+            const allMemberships = ["join", "invite", "leave"];
+            for(const membership of allMemberships) {
+                const membershipSection = roomsSection[membership];
+                if (membershipSection) {
+                    return Object.entries(membershipSection).map(([roomId, roomResponse]) => {
+                        return roomCallback(roomId, roomResponse, membership);
+                    });
+                }
+            }
+        }
+        return [];
+    }
+
+    class Sync {
+        constructor({hsApi, session, storage}) {
+            this._hsApi = hsApi;
+            this._session = session;
+            this._storage = storage;
+            this._currentRequest = null;
+            this._status = new ObservableValue(SyncStatus.Stopped);
+            this._error = null;
+        }
+
+        get status() {
+            return this._status;
+        }
+
+        /** the error that made the sync stop */
+        get error() {
+            return this._error;
+        }
+
+        start() {
+            // not already syncing?
+            if (this._status.get() !== SyncStatus.Stopped) {
+                return;
+            }
+            let syncToken = this._session.syncToken;
+            if (syncToken) {
+                this._status.set(SyncStatus.CatchupSync);
+            } else {
+                this._status.set(SyncStatus.InitialSync);
+            }
+            this._syncLoop(syncToken);
+        }
+
+        async _syncLoop(syncToken) {
+            // if syncToken is falsy, it will first do an initial sync ... 
+            while(this._status.get() !== SyncStatus.Stopped) {
+                try {
+                    console.log(`starting sync request with since ${syncToken} ...`);
+                    const timeout = syncToken ? INCREMENTAL_TIMEOUT : undefined; 
+                    syncToken = await this._syncRequest(syncToken, timeout);
+                    this._status.set(SyncStatus.Syncing);
+                } catch (err) {
+                    if (!(err instanceof AbortError)) {
+                        this._error = err;
+                        this._status.set(SyncStatus.Stopped);
+                    }
                 }
             }
         }
 
-        async get(id) {
-            const sessions = await this.getAll();
-            if (sessions) {
-                return sessions.find(session => session.id === id);
+        async _syncRequest(syncToken, timeout) {
+            let {syncFilterId} = this._session;
+            if (typeof syncFilterId !== "string") {
+                this._currentRequest = this._hsApi.createFilter(this._session.user.id, {room: {state: {lazy_load_members: true}}});
+                syncFilterId = (await this._currentRequest.response()).filter_id;
+            }
+            const totalRequestTimeout = timeout + (80 * 1000);  // same as riot-web, don't get stuck on wedged long requests
+            this._currentRequest = this._hsApi.sync(syncToken, syncFilterId, timeout, {timeout: totalRequestTimeout});
+            const response = await this._currentRequest.response();
+            syncToken = response.next_batch;
+            const storeNames = this._storage.storeNames;
+            const syncTxn = await this._storage.readWriteTxn([
+                storeNames.session,
+                storeNames.roomSummary,
+                storeNames.roomState,
+                storeNames.timelineEvents,
+                storeNames.timelineFragments,
+                storeNames.pendingEvents,
+            ]);
+            const roomChanges = [];
+            let sessionChanges;
+            try {
+                sessionChanges = this._session.writeSync(syncToken, syncFilterId, response.account_data,  syncTxn);
+                // to_device
+                // presence
+                if (response.rooms) {
+                    const promises = parseRooms(response.rooms, async (roomId, roomResponse, membership) => {
+                        let room = this._session.rooms.get(roomId);
+                        if (!room) {
+                            room = this._session.createRoom(roomId);
+                        }
+                        console.log(` * applying sync response to room ${roomId} ...`);
+                        const changes = await room.writeSync(roomResponse, membership, syncTxn);
+                        roomChanges.push({room, changes});
+                    });
+                    await Promise.all(promises);
+                }
+            } catch(err) {
+                console.warn("aborting syncTxn because of error");
+                // avoid corrupting state by only
+                // storing the sync up till the point
+                // the exception occurred
+                syncTxn.abort();
+                throw err;
+            }
+            try {
+                await syncTxn.complete();
+                console.info("syncTxn committed!!");
+            } catch (err) {
+                console.error("unable to commit sync tranaction");
+                throw err;
+            }
+            this._session.afterSync(sessionChanges);
+            // emit room related events after txn has been closed
+            for(let {room, changes} of roomChanges) {
+                room.afterSync(changes);
+            }
+
+            return syncToken;
+        }
+
+        stop() {
+            if (this._status.get() === SyncStatus.Stopped) {
+                return;
+            }
+            this._status.set(SyncStatus.Stopped);
+            if (this._currentRequest) {
+                this._currentRequest.abort();
+                this._currentRequest = null;
             }
         }
-
-        async add(sessionInfo) {
-            const sessions = await this.getAll();
-            sessions.push(sessionInfo);
-            localStorage.setItem(this._name, JSON.stringify(sessions));
-        }
-
-        async delete(sessionId) {
-            let sessions = await this.getAll();
-            sessions = sessions.filter(s => s.id !== sessionId);
-            localStorage.setItem(this._name, JSON.stringify(sessions));
-        }
-        
     }
 
     class EventEmitter {
@@ -1322,6 +685,13 @@ var main = (function () {
                 for(const h of handlers) {
                     h(...values);
                 }
+            }
+        }
+
+        disposableOn(name, callback) {
+            this.on(name, callback);
+            return () => {
+                this.off(name, callback);
             }
         }
 
@@ -1349,7 +719,6 @@ var main = (function () {
 
         onLastSubscriptionRemoved(name) {}
     }
-    //#endif
 
     function applySyncResponse(data, roomResponse, membership) {
         if (roomResponse.summary) {
@@ -1511,6 +880,76 @@ var main = (function () {
     	}
     }
 
+    const WebPlatform = {
+        get minStorageKey() {
+            // for indexeddb, we use unsigned 32 bit integers as keys
+            return 0;
+        },
+        
+        get middleStorageKey() {
+            // for indexeddb, we use unsigned 32 bit integers as keys
+            return 0x7FFFFFFF;
+        },
+
+        get maxStorageKey() {
+            // for indexeddb, we use unsigned 32 bit integers as keys
+            return 0xFFFFFFFF;
+        },
+
+        delay(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        }
+    };
+
+    // key for events in the timelineEvents store
+    class EventKey {
+        constructor(fragmentId, eventIndex) {
+            this.fragmentId = fragmentId;
+            this.eventIndex = eventIndex;
+        }
+
+        nextFragmentKey() {
+            // could take MIN_EVENT_INDEX here if it can't be paged back
+            return new EventKey(this.fragmentId + 1, WebPlatform.middleStorageKey);
+        }
+
+        nextKeyForDirection(direction) {
+            if (direction.isForward) {
+                return this.nextKey();
+            } else {
+                return this.previousKey();
+            }
+        }
+
+        previousKey() {
+            return new EventKey(this.fragmentId, this.eventIndex - 1);
+        }
+
+        nextKey() {
+            return new EventKey(this.fragmentId, this.eventIndex + 1);
+        }
+
+        static get maxKey() {
+            return new EventKey(WebPlatform.maxStorageKey, WebPlatform.maxStorageKey);
+        }
+
+        static get minKey() {
+            return new EventKey(WebPlatform.minStorageKey, WebPlatform.minStorageKey);
+        }
+
+        static get defaultLiveKey() {
+            return EventKey.defaultFragmentKey(WebPlatform.minStorageKey);
+        }
+
+        static defaultFragmentKey(fragmentId) {
+            return new EventKey(fragmentId, WebPlatform.middleStorageKey);
+        }
+
+        toString() {
+            return `[${this.fragmentId}/${this.eventIndex}]`;
+        }
+    }
+
     //entries can be sorted, first by fragment, then by entry index.
     const PENDING_FRAGMENT_ID = Number.MAX_SAFE_INTEGER;
 
@@ -1660,9 +1099,9 @@ var main = (function () {
 
         get entryIndex() {
             if (this.started) {
-                return Platform.minStorageKey;
+                return WebPlatform.minStorageKey;
             } else {
-                return Platform.maxStorageKey;
+                return WebPlatform.maxStorageKey;
             }
         }
 
@@ -1878,7 +1317,6 @@ var main = (function () {
             this._lastLiveKey = newLiveKey;
         }
     }
-    //#endif
 
     class GapWriter {
         constructor({roomId, storage, fragmentIdComparer}) {
@@ -2055,42 +1493,8 @@ var main = (function () {
             return {entries, fragments};
         }
     }
-    //#endif
 
-    class BaseObservableCollection {
-        constructor() {
-            this._handlers = new Set();
-        }
-
-        onSubscribeFirst() {
-
-        }
-
-        onUnsubscribeLast() {
-
-        }
-
-        subscribe(handler) {
-            this._handlers.add(handler);
-            if (this._handlers.size === 1) {
-                this.onSubscribeFirst();
-            }
-            return () => {
-                if (handler) {
-                    this._handlers.delete(handler);
-                    if (this._handlers.size === 0) {
-                        this.onUnsubscribeLast();
-                    }
-                    handler = null;
-                }
-                return null;
-            };
-        }
-
-        // Add iterator over handlers here
-    }
-
-    class BaseObservableList extends BaseObservableCollection {
+    class BaseObservableList extends BaseObservable {
         emitReset() {
             for(let h of this._handlers) {
                 h.onReset(this);
@@ -2160,7 +1564,7 @@ var main = (function () {
         return high;
     }
 
-    class BaseObservableMap extends BaseObservableCollection {
+    class BaseObservableMap extends BaseObservable {
         emitReset() {
             for(let h of this._handlers) {
                 h.onReset();
@@ -2242,7 +1646,6 @@ var main = (function () {
             return this._values.entries();
         }
     }
-    //#endif
 
     /*
 
@@ -2355,7 +1758,6 @@ var main = (function () {
             }
         }
     }
-    //#endif
 
     class FilteredMap extends BaseObservableMap {
         constructor(source, mapper, updater) {
@@ -2855,6 +2257,9 @@ var main = (function () {
             this._remoteEntries.setManySorted(entries);
         }
 
+        // TODO: should we rather have generic methods for
+        // - adding new entries
+        // - updating existing entries (redaction, relations)
         /** @package */
         appendLiveEntries(newEntries) {
             this._remoteEntries.setManySorted(newEntries);
@@ -2886,7 +2291,10 @@ var main = (function () {
 
         /** @public */
         close() {
-            this._closeCallback();
+            if (this._closeCallback) {
+                this._closeCallback();
+                this._closeCallback = null;
+            }
         }
     }
 
@@ -3069,7 +2477,6 @@ var main = (function () {
             this.rebuild(this._fragmentsById.values());
         }
     }
-    //#endif
 
     class PendingEvent {
         constructor(data) {
@@ -3115,7 +2522,6 @@ var main = (function () {
                 while (this._amountSent < this._pendingEvents.length) {
                     const pendingEvent = this._pendingEvents.get(this._amountSent);
                     console.log("trying to send", pendingEvent.content.body);
-                    this._amountSent += 1;
                     if (pendingEvent.remoteId) {
                         continue;
                     }
@@ -3134,9 +2540,10 @@ var main = (function () {
                     console.log("writing remoteId now");
                     await this._tryUpdateEvent(pendingEvent);
                     console.log("keep sending?", this._amountSent, "<", this._pendingEvents.length);
+                    this._amountSent += 1;
                 }
             } catch(err) {
-                if (err instanceof NetworkError) {
+                if (err instanceof ConnectionError) {
                     this._offline = true;
                 }
             } finally {
@@ -3351,12 +2758,16 @@ var main = (function () {
             if (this._timeline) {
                 throw new Error("not dealing with load race here for now");
             }
+            console.log(`opening the timeline for ${this._roomId}`);
             this._timeline = new Timeline({
                 roomId: this.id,
                 storage: this._storage,
                 fragmentIdComparer: this._fragmentIdComparer,
                 pendingEvents: this._sendQueue.pendingEvents,
-                closeCallback: () => this._timeline = null,
+                closeCallback: () => {
+                    console.log(`closing the timeline for ${this._roomId}`);
+                    this._timeline = null;
+                },
                 user: this._user,
             });
             await this._timeline.load();
@@ -3377,7 +2788,7 @@ var main = (function () {
             if (!retryAfterMs) {
                 retryAfterMs = 5000;
             }
-            await Platform.delay(retryAfterMs);
+            await WebPlatform.delay(retryAfterMs);
         }
 
         // do we have to know about succeeding requests?
@@ -3411,7 +2822,7 @@ var main = (function () {
             this._hsApi = hsApi;
             this._sendRequests = [];
             this._sendScheduled = false;
-            this._offline = false;
+            this._stopped = false;
             this._waitTime = 0;
             this._backoff = backoff;
             /* 
@@ -3425,6 +2836,18 @@ var main = (function () {
             // this._enabled;
         }
 
+        stop() {
+            // TODO: abort current requests and set offline
+        }
+
+        start() {
+            this._stopped = false;
+        }
+
+        get isStarted() {
+            return !this._stopped;
+        }
+
         // this should really be per roomId to avoid head-of-line blocking
         // 
         // takes a callback instead of returning a promise with the slot
@@ -3433,7 +2856,7 @@ var main = (function () {
             let request;
             const promise = new Promise((resolve, reject) => request = {resolve, reject, sendCallback});
             this._sendRequests.push(request);
-            if (!this._sendScheduled && !this._offline) {
+            if (!this._sendScheduled && !this._stopped) {
                 this._sendLoop();
             }
             return promise;
@@ -3447,10 +2870,10 @@ var main = (function () {
                     // this can throw!
                     result = await this._doSend(request.sendCallback);
                 } catch (err) {
-                    if (err instanceof NetworkError) {
+                    if (err instanceof ConnectionError) {
                         // we're offline, everybody will have
                         // to re-request slots when we come back online
-                        this._offline = true;
+                        this._stopped = true;
                         for (const r of this._sendRequests) {
                             r.reject(err);
                         }
@@ -3530,7 +2953,28 @@ var main = (function () {
             }));
         }
 
-        notifyNetworkAvailable() {
+        get isStarted() {
+            return this._sendScheduler.isStarted;
+        }
+
+        stop() {
+            this._sendScheduler.stop();
+        }
+
+        async start(lastVersionResponse) {
+            if (lastVersionResponse) {
+                // store /versions response
+                const txn = await this._storage.readWriteTxn([
+                    this._storage.storeNames.session
+                ]);
+                const newSessionData = Object.assign({}, this._session, {serverVersions: lastVersionResponse});
+                txn.session.set(newSessionData);
+                // TODO: what can we do if this throws?
+                await txn.complete();
+                this._session = newSessionData;
+            }
+
+            this._sendScheduler.start();
             for (const [, room] of this._rooms) {
                 room.resumeSending();
             }
@@ -3596,140 +3040,1286 @@ var main = (function () {
         }
     }
 
-    const INCREMENTAL_TIMEOUT = 30000;
+    const LoadStatus = createEnum(
+        "NotLoading",
+        "Login",
+        "LoginFailed",
+        "Loading",
+        "Migrating",    //not used atm, but would fit here
+        "FirstSync",
+        "Error",
+        "Ready",
+    );
 
-    function parseRooms(roomsSection, roomCallback) {
-        if (roomsSection) {
-            const allMemberships = ["join", "invite", "leave"];
-            for(const membership of allMemberships) {
-                const membershipSection = roomsSection[membership];
-                if (membershipSection) {
-                    return Object.entries(membershipSection).map(([roomId, roomResponse]) => {
-                        return roomCallback(roomId, roomResponse, membership);
-                    });
-                }
-            }
+    const LoginFailure = createEnum(
+        "Connection",
+        "Credentials",
+        "Unknown",
+    );
+
+    class SessionContainer {
+        constructor({clock, random, onlineStatus, request, storageFactory, sessionInfoStorage}) {
+            this._random = random;
+            this._clock = clock;
+            this._onlineStatus = onlineStatus;
+            this._request = request;
+            this._storageFactory = storageFactory;
+            this._sessionInfoStorage = sessionInfoStorage;
+
+            this._status = new ObservableValue(LoadStatus.NotLoading);
+            this._error = null;
+            this._loginFailure = null;
+            this._reconnector = null;
+            this._session = null;
+            this._sync = null;
+            this._sessionId = null;
+            this._storage = null;
         }
-        return [];
-    }
 
-    class Sync extends EventEmitter {
-        constructor({hsApi, session, storage}) {
-            super();
-            this._hsApi = hsApi;
-            this._session = session;
-            this._storage = storage;
-            this._isSyncing = false;
-            this._currentRequest = null;
+        createNewSessionId() {
+            return (Math.floor(this._random() * Number.MAX_SAFE_INTEGER)).toString();
         }
 
-        get isSyncing() {
-            return this._isSyncing;
-        }
-
-        // returns when initial sync is done
-        async start() {
-            if (this._isSyncing) {
+        async startWithExistingSession(sessionId) {
+            if (this._status.get() !== LoadStatus.NotLoading) {
                 return;
             }
-            this._isSyncing = true;
-            this.emit("status", "started");
-            let syncToken = this._session.syncToken;
-            // do initial sync if needed
-            if (!syncToken) {
-                // need to create limit filter here
-                syncToken = await this._syncRequest();
-            }
-            this._syncLoop(syncToken);
-        }
-
-        async _syncLoop(syncToken) {
-            // if syncToken is falsy, it will first do an initial sync ... 
-            while(this._isSyncing) {
-                try {
-                    console.log(`starting sync request with since ${syncToken} ...`);
-                    syncToken = await this._syncRequest(syncToken, INCREMENTAL_TIMEOUT);
-                } catch (err) {
-                    this._isSyncing = false;
-                    if (!(err instanceof RequestAbortError)) {
-                        console.error("stopping sync because of error");
-                        console.error(err);
-                        this.emit("status", "error", err);
-                    }
-                }
-            }
-            this.emit("status", "stopped");
-        }
-
-        async _syncRequest(syncToken, timeout) {
-            let {syncFilterId} = this._session;
-            if (typeof syncFilterId !== "string") {
-                syncFilterId = (await this._hsApi.createFilter(this._session.user.id, {room: {state: {lazy_load_members: true}}}).response()).filter_id;
-            }
-            this._currentRequest = this._hsApi.sync(syncToken, syncFilterId, timeout);
-            const response = await this._currentRequest.response();
-            syncToken = response.next_batch;
-            const storeNames = this._storage.storeNames;
-            const syncTxn = await this._storage.readWriteTxn([
-                storeNames.session,
-                storeNames.roomSummary,
-                storeNames.roomState,
-                storeNames.timelineEvents,
-                storeNames.timelineFragments,
-                storeNames.pendingEvents,
-            ]);
-            const roomChanges = [];
-            let sessionChanges;
+            this._status.set(LoadStatus.Loading);
             try {
-                sessionChanges = this._session.writeSync(syncToken, syncFilterId, response.account_data,  syncTxn);
-                // to_device
-                // presence
-                if (response.rooms) {
-                    const promises = parseRooms(response.rooms, async (roomId, roomResponse, membership) => {
-                        let room = this._session.rooms.get(roomId);
-                        if (!room) {
-                            room = this._session.createRoom(roomId);
-                        }
-                        console.log(` * applying sync response to room ${roomId} ...`);
-                        const changes = await room.writeSync(roomResponse, membership, syncTxn);
-                        roomChanges.push({room, changes});
-                    });
-                    await Promise.all(promises);
+                const sessionInfo = await this._sessionInfoStorage.get(sessionId);
+                if (!sessionInfo) {
+                    throw new Error("Invalid session id: " + sessionId);
                 }
-            } catch(err) {
-                console.warn("aborting syncTxn because of error");
-                // avoid corrupting state by only
-                // storing the sync up till the point
-                // the exception occurred
-                syncTxn.abort();
-                throw err;
-            }
-            try {
-                await syncTxn.complete();
-                console.info("syncTxn committed!!");
+                await this._loadSessionInfo(sessionInfo);
             } catch (err) {
-                console.error("unable to commit sync tranaction");
-                throw err;
+                this._error = err;
+                this._status.set(LoadStatus.Error);
             }
-            this._session.afterSync(sessionChanges);
-            // emit room related events after txn has been closed
-            for(let {room, changes} of roomChanges) {
-                room.afterSync(changes);
-            }
+        }
 
-            return syncToken;
+        async startWithLogin(homeServer, username, password) {
+            if (this._status.get() !== LoadStatus.NotLoading) {
+                return;
+            }
+            this._status.set(LoadStatus.Login);
+            let sessionInfo;
+            try {
+                const hsApi = new HomeServerApi({homeServer, request: this._request, createTimeout: this._clock.createTimeout});
+                const loginData = await hsApi.passwordLogin(username, password).response();
+                const sessionId = this.createNewSessionId();
+                sessionInfo = {
+                    id: sessionId,
+                    deviceId: loginData.device_id,
+                    userId: loginData.user_id,
+                    homeServer: homeServer,
+                    accessToken: loginData.access_token,
+                    lastUsed: this._clock.now()
+                };
+                await this._sessionInfoStorage.add(sessionInfo);            
+            } catch (err) {
+                this._error = err;
+                if (err instanceof HomeServerError) {
+                    if (err.errcode === "M_FORBIDDEN") {
+                        this._loginFailure = LoginFailure.Credentials;
+                    } else {
+                        this._loginFailure = LoginFailure.Unknown;
+                    }
+                    this._status.set(LoadStatus.LoginFailed);
+                } else if (err instanceof ConnectionError) {
+                    this._loginFailure = LoginFailure.Connection;
+                    this._status.set(LoadStatus.LoginFailure);
+                } else {
+                    this._status.set(LoadStatus.Error);
+                }
+                return;
+            }
+            // loading the session can only lead to
+            // LoadStatus.Error in case of an error,
+            // so separate try/catch
+            try {
+                await this._loadSessionInfo(sessionInfo);
+            } catch (err) {
+                this._error = err;
+                this._status.set(LoadStatus.Error);
+            }
+        }
+
+        async _loadSessionInfo(sessionInfo) {
+            this._status.set(LoadStatus.Loading);
+            this._reconnector = new Reconnector({
+                onlineStatus: this._onlineStatus,
+                retryDelay: new ExponentialRetryDelay(this._clock.createTimeout),
+                createMeasure: this._clock.createMeasure
+            });
+            const hsApi = new HomeServerApi({
+                homeServer: sessionInfo.homeServer,
+                accessToken: sessionInfo.accessToken,
+                request: this._request,
+                reconnector: this._reconnector,
+                createTimeout: this._clock.createTimeout
+            });
+            this._sessionId = sessionInfo.id;
+            this._storage = await this._storageFactory.create(sessionInfo.id);
+            // no need to pass access token to session
+            const filteredSessionInfo = {
+                deviceId: sessionInfo.deviceId,
+                userId: sessionInfo.userId,
+                homeServer: sessionInfo.homeServer,
+            };
+            this._session = new Session({storage: this._storage, sessionInfo: filteredSessionInfo, hsApi});
+            await this._session.load();
+            
+            this._sync = new Sync({hsApi, storage: this._storage, session: this._session});
+            // notify sync and session when back online
+            this._reconnectSubscription = this._reconnector.connectionStatus.subscribe(state => {
+                if (state === ConnectionStatus.Online) {
+                    this._sync.start();
+                    this._session.start(this._reconnector.lastVersionsResponse);
+                }
+            });
+            await this._waitForFirstSync();
+
+            this._status.set(LoadStatus.Ready);
+
+            // if the sync failed, and then the reconnector
+            // restored the connection, it would have already
+            // started to session, so check first
+            // to prevent an extra /versions request
+            if (this._session.isStarted) {
+                const lastVersionsResponse = await hsApi.versions({timeout: 10000}).response();
+                this._session.start(lastVersionsResponse);
+            }
+        }
+
+        async _waitForFirstSync() {
+            try {
+                this._sync.start();
+                this._status.set(LoadStatus.FirstSync);
+            } catch (err) {
+                // swallow ConnectionError here and continue,
+                // as the reconnector above will call 
+                // sync.start again to retry in this case
+                if (!(err instanceof ConnectionError)) {
+                    throw err;
+                }
+            }
+            // only transition into Ready once the first sync has succeeded
+            this._waitForFirstSyncHandle = this._sync.status.waitFor(s => s === SyncStatus.Syncing);
+            try {
+                await this._waitForFirstSyncHandle.promise;
+            } catch (err) {
+                // if dispose is called from stop, bail out
+                if (err instanceof AbortError) {
+                    return;
+                }
+                throw err;
+            } finally {
+                this._waitForFirstSyncHandle = null;
+            }
+        }
+
+
+        get loadStatus() {
+            return this._status;
+        }
+
+        get loadError() {
+            return this._error;
+        }
+
+        /** only set at loadStatus InitialSync, CatchupSync or Ready */
+        get sync() {
+            return this._sync;
+        }
+
+        /** only set at loadStatus InitialSync, CatchupSync or Ready */
+        get session() {
+            return this._session;
+        }
+
+        get reconnector() {
+            return this._reconnector;
         }
 
         stop() {
-            if (!this._isSyncing) {
-                return;
+            this._reconnectSubscription();
+            this._reconnectSubscription = null;
+            this._sync.stop();
+            this._session.stop();
+            if (this._waitForFirstSyncHandle) {
+                this._waitForFirstSyncHandle.dispose();
+                this._waitForFirstSyncHandle = null;
             }
-            this._isSyncing = false;
-            if (this._currentRequest) {
-                this._currentRequest.abort();
-                this._currentRequest = null;
+            if (this._storage) {
+                this._storage.close();
+                this._storage = null;
             }
         }
+
+        async deleteSession() {
+            if (this._sessionId) {
+                // if one fails, don't block the other from trying
+                // also, run in parallel
+                await Promise.all([
+                    this._storageFactory.delete(this._sessionId),
+                    this._sessionInfoStorage.delete(this._sessionId),
+                ]);
+                this._sessionId = null;
+            }
+        }
+    }
+
+    const STORE_NAMES = Object.freeze([
+        "session",
+        "roomState",
+        "roomSummary",
+        "timelineEvents",
+        "timelineFragments",
+        "pendingEvents",
+    ]);
+
+    const STORE_MAP = Object.freeze(STORE_NAMES.reduce((nameMap, name) => {
+        nameMap[name] = name;
+        return nameMap;
+    }, {}));
+
+    class StorageError extends Error {
+        constructor(message, cause, value) {
+            let fullMessage = message;
+            if (cause) {
+                fullMessage += ": ";
+                if (typeof cause.name === "string") {
+                    fullMessage += `(name: ${cause.name}) `;
+                }
+                if (typeof cause.code === "number") {
+                    fullMessage += `(code: ${cause.name}) `;
+                }
+                fullMessage += cause.message;
+            }
+            super(fullMessage);
+            if (cause) {
+                this.errcode = cause.name;
+            }
+            this.cause = cause;
+            this.value = value;
+        }
+    }
+
+    // storage keys are defined to be unsigned 32bit numbers in WebPlatform.js, which is assumed by idb
+    function encodeUint32(n) {
+        const hex = n.toString(16);
+        return "0".repeat(8 - hex.length) + hex;
+    }
+
+    function decodeUint32(str) {
+        return parseInt(str, 16);
+    }
+
+    function openDatabase(name, createObjectStore, version) {
+        const req = window.indexedDB.open(name, version);
+        req.onupgradeneeded = (ev) => {
+            const db = ev.target.result;
+            const oldVersion = ev.oldVersion;
+            createObjectStore(db, oldVersion, version);
+        }; 
+        return reqAsPromise(req);
+    }
+
+    function wrapError(err) {
+        return new StorageError(`wrapped DOMException`, err);
+    }
+
+    function reqAsPromise(req) {
+        return new Promise((resolve, reject) => {
+            req.addEventListener("success", event => resolve(event.target.result));
+            req.addEventListener("error", event => reject(wrapError(event.target.error)));
+        });
+    }
+
+    function txnAsPromise(txn) {
+        return new Promise((resolve, reject) => {
+            txn.addEventListener("complete", resolve);
+            txn.addEventListener("abort", event => reject(wrapError(event.target.error)));
+        });
+    }
+
+    function iterateCursor(cursorRequest, processValue) {
+        // TODO: does cursor already have a value here??
+        return new Promise((resolve, reject) => {
+            cursorRequest.onerror = () => {
+                reject(new StorageError("Query failed", cursorRequest.error));
+            };
+            // collect results
+            cursorRequest.onsuccess = (event) => {
+                const cursor = event.target.result;
+                if (!cursor) {
+                    resolve(false);
+                    return; // end of results
+                }
+                const {done, jumpTo} = processValue(cursor.value, cursor.key);
+                if (done) {
+                    resolve(true);
+                } else if(jumpTo) {
+                    cursor.continue(jumpTo);
+                } else {
+                    cursor.continue();
+                }
+            };
+        }).catch(err => {
+            throw new StorageError("iterateCursor failed", err);
+        });
+    }
+
+    class QueryTarget {
+        constructor(target) {
+            this._target = target;
+        }
+
+        _openCursor(range, direction) {
+            if (range && direction) {
+                return this._target.openCursor(range, direction);
+            } else if (range) {
+                return this._target.openCursor(range);
+            } else if (direction) {
+                return this._target.openCursor(null, direction);
+            } else {
+                return this._target.openCursor();
+            }
+        }
+
+        supports(methodName) {
+            return this._target.supports(methodName);
+        }
+
+        get(key) {
+            return reqAsPromise(this._target.get(key));
+        }
+
+        getKey(key) {
+            return reqAsPromise(this._target.getKey(key));
+        }
+
+        reduce(range, reducer, initialValue) {
+            return this._reduce(range, reducer, initialValue, "next");
+        }
+
+        reduceReverse(range, reducer, initialValue) {
+            return this._reduce(range, reducer, initialValue, "prev");
+        }
+        
+        selectLimit(range, amount) {
+            return this._selectLimit(range, amount, "next");
+        }
+
+        selectLimitReverse(range, amount) {
+            return this._selectLimit(range, amount, "prev");
+        }
+
+        selectWhile(range, predicate) {
+            return this._selectWhile(range, predicate, "next");
+        }
+
+        selectWhileReverse(range, predicate) {
+            return this._selectWhile(range, predicate, "prev");
+        }
+
+        async selectAll(range, direction) {
+            const cursor = this._openCursor(range, direction);
+            const results = [];
+            await iterateCursor(cursor, (value) => {
+                results.push(value);
+                return {done: false};
+            });
+            return results;
+        }
+
+        selectFirst(range) {
+            return this._find(range, () => true, "next");
+        }
+
+        selectLast(range) {
+            return this._find(range, () => true, "prev");
+        }
+
+        find(range, predicate) {
+            return this._find(range, predicate, "next");
+        }
+
+        findReverse(range, predicate) {
+            return this._find(range, predicate, "prev");
+        }
+
+        async findMaxKey(range) {
+            const cursor = this._target.openKeyCursor(range, "prev");
+            let maxKey;
+            await iterateCursor(cursor, (_, key) => {
+                maxKey = key;
+                return {done: true};
+            });
+            return maxKey;
+        }
+
+        /**
+         * Checks if a given set of keys exist.
+         * Calls `callback(key, found)` for each key in `keys`, in key sorting order (or reversed if backwards=true).
+         * If the callback returns true, the search is halted and callback won't be called again.
+         * `callback` is called with the same instances of the key as given in `keys`, so direct comparison can be used.
+         */
+        async findExistingKeys(keys, backwards, callback) {
+            const direction = backwards ? "prev" : "next";
+            const compareKeys = (a, b) => backwards ? -indexedDB.cmp(a, b) : indexedDB.cmp(a, b);
+            const sortedKeys = keys.slice().sort(compareKeys);
+            const firstKey = backwards ? sortedKeys[sortedKeys.length - 1] : sortedKeys[0];
+            const lastKey = backwards ? sortedKeys[0] : sortedKeys[sortedKeys.length - 1];
+            const cursor = this._target.openKeyCursor(IDBKeyRange.bound(firstKey, lastKey), direction);
+            let i = 0;
+            let consumerDone = false;
+            await iterateCursor(cursor, (value, key) => {
+                // while key is larger than next key, advance and report false
+                while(i < sortedKeys.length && compareKeys(sortedKeys[i], key) < 0 && !consumerDone) {
+                    consumerDone = callback(sortedKeys[i], false);
+                    ++i;
+                }
+                if (i < sortedKeys.length && compareKeys(sortedKeys[i], key) === 0 && !consumerDone) {
+                    consumerDone = callback(sortedKeys[i], true);
+                    ++i;
+                }
+                const done = consumerDone || i >= sortedKeys.length;
+                const jumpTo = !done && sortedKeys[i];
+                return {done, jumpTo};
+            });
+            // report null for keys we didn't to at the end
+            while (!consumerDone && i < sortedKeys.length) {
+                consumerDone = callback(sortedKeys[i], false);
+                ++i;
+            }
+        }
+
+        _reduce(range, reducer, initialValue, direction) {
+            let reducedValue = initialValue;
+            const cursor = this._openCursor(range, direction);
+            return iterateCursor(cursor, (value) => {
+                reducedValue = reducer(reducedValue, value);
+                return {done: false};
+            });
+        }
+
+        _selectLimit(range, amount, direction) {
+            return this._selectWhile(range, (results) => {
+                return results.length === amount;
+            }, direction);
+        }
+
+        async _selectWhile(range, predicate, direction) {
+            const cursor = this._openCursor(range, direction);
+            const results = [];
+            await iterateCursor(cursor, (value) => {
+                results.push(value);
+                return {done: predicate(results)};
+            });
+            return results;
+        }
+
+        async _find(range, predicate, direction) {
+            const cursor = this._openCursor(range, direction);
+            let result;
+            const found = await iterateCursor(cursor, (value) => {
+                const found = predicate(value);
+                if (found) {
+                    result = value;
+                }
+                return {done: found};
+            });
+            if (found) {
+                return result;
+            }
+        }
+    }
+
+    class QueryTargetWrapper {
+        constructor(qt) {
+            this._qt = qt;
+        }
+
+        supports(methodName) {
+            return !!this._qt[methodName];
+        }
+        
+        openKeyCursor(...params) {
+            // not supported on Edge 15
+            if (!this._qt.openKeyCursor) {
+                return this.openCursor(...params);
+            }
+            try {
+                return this._qt.openKeyCursor(...params);
+            } catch(err) {
+                throw new StorageError("openKeyCursor failed", err);
+            }
+        }
+        
+        openCursor(...params) {
+            try {
+                return this._qt.openCursor(...params);
+            } catch(err) {
+                throw new StorageError("openCursor failed", err);
+            }
+        }
+
+        put(...params) {
+            try {
+                return this._qt.put(...params);
+            } catch(err) {
+                throw new StorageError("put failed", err);
+            }
+        }
+
+        add(...params) {
+            try {
+                return this._qt.add(...params);
+            } catch(err) {
+                throw new StorageError("add failed", err);
+            }
+        }
+
+        get(...params) {
+            try {
+                return this._qt.get(...params);
+            } catch(err) {
+                throw new StorageError("get failed", err);
+            }
+        }
+        
+        getKey(...params) {
+            try {
+                return this._qt.getKey(...params);
+            } catch(err) {
+                throw new StorageError("getKey failed", err);
+            }
+        }
+
+        delete(...params) {
+            try {
+                return this._qt.delete(...params);
+            } catch(err) {
+                throw new StorageError("delete failed", err);
+            }
+        }
+
+        index(...params) {
+            try {
+                return this._qt.index(...params);
+            } catch(err) {
+                throw new StorageError("index failed", err);
+            }
+        }
+    }
+
+    class Store extends QueryTarget {
+        constructor(idbStore) {
+            super(new QueryTargetWrapper(idbStore));
+        }
+
+        get _idbStore() {
+            return this._target;
+        }
+
+        index(indexName) {
+            return new QueryTarget(new QueryTargetWrapper(this._idbStore.index(indexName)));
+        }
+
+        async put(value) {
+            try {
+                return await reqAsPromise(this._idbStore.put(value));
+            } catch(err) {
+                const originalErr = err.cause;
+                throw new StorageError(`put on ${this._idbStore.name} failed`, originalErr, value);
+            }
+        }
+
+        async add(value) {
+            try {
+                return await reqAsPromise(this._idbStore.add(value));
+            } catch(err) {
+                const originalErr = err.cause;
+                throw new StorageError(`add on ${this._idbStore.name} failed`, originalErr, value);
+            }
+        }
+
+        delete(keyOrKeyRange) {
+            return reqAsPromise(this._idbStore.delete(keyOrKeyRange));
+        }
+    }
+
+    /**
+    store contains:
+    	loginData {
+    		device_id
+    		home_server
+    		access_token
+    		user_id
+    	}
+    	// flags {
+    	// 	lazyLoading?
+    	// }
+    	syncToken
+    	displayName
+    	avatarUrl
+    	lastSynced
+    */
+    class SessionStore {
+    	constructor(sessionStore) {
+    		this._sessionStore = sessionStore;
+    	}
+
+    	async get() {
+    		const session = await this._sessionStore.selectFirst(IDBKeyRange.only(1));
+    		if (session) {
+    			return session.value;
+    		}
+    	}
+
+    	set(session) {
+    		return this._sessionStore.put({key: 1, value: session});
+    	}
+    }
+
+    /**
+    store contains:
+    	roomId
+    	name
+    	lastMessage
+    	unreadCount
+    	mentionCount
+    	isEncrypted
+    	isDirectMessage
+    	membership
+    	inviteCount
+    	joinCount
+    */
+    class RoomSummaryStore {
+    	constructor(summaryStore) {
+    		this._summaryStore = summaryStore;
+    	}
+
+    	getAll() {
+    		return this._summaryStore.selectAll();
+    	}
+
+    	set(summary) {
+    		return this._summaryStore.put(summary);
+    	}
+    }
+
+    function encodeKey(roomId, fragmentId, eventIndex) {
+        return `${roomId}|${encodeUint32(fragmentId)}|${encodeUint32(eventIndex)}`;
+    }
+
+    function encodeEventIdKey(roomId, eventId) {
+        return `${roomId}|${eventId}`;
+    }
+
+    function decodeEventIdKey(eventIdKey) {
+        const [roomId, eventId] = eventIdKey.split("|");
+        return {roomId, eventId};
+    }
+
+    class Range {
+        constructor(only, lower, upper, lowerOpen, upperOpen) {
+            this._only = only;
+            this._lower = lower;
+            this._upper = upper;
+            this._lowerOpen = lowerOpen;
+            this._upperOpen = upperOpen;
+        }
+
+        asIDBKeyRange(roomId) {
+            try {
+                // only
+                if (this._only) {
+                    return IDBKeyRange.only(encodeKey(roomId, this._only.fragmentId, this._only.eventIndex));
+                }
+                // lowerBound
+                // also bound as we don't want to move into another roomId
+                if (this._lower && !this._upper) {
+                    return IDBKeyRange.bound(
+                        encodeKey(roomId, this._lower.fragmentId, this._lower.eventIndex),
+                        encodeKey(roomId, this._lower.fragmentId, WebPlatform.maxStorageKey),
+                        this._lowerOpen,
+                        false
+                    );
+                }
+                // upperBound
+                // also bound as we don't want to move into another roomId
+                if (!this._lower && this._upper) {
+                    return IDBKeyRange.bound(
+                        encodeKey(roomId, this._upper.fragmentId, WebPlatform.minStorageKey),
+                        encodeKey(roomId, this._upper.fragmentId, this._upper.eventIndex),
+                        false,
+                        this._upperOpen
+                    );
+                }
+                // bound
+                if (this._lower && this._upper) {
+                    return IDBKeyRange.bound(
+                        encodeKey(roomId, this._lower.fragmentId, this._lower.eventIndex),
+                        encodeKey(roomId, this._upper.fragmentId, this._upper.eventIndex),
+                        this._lowerOpen,
+                        this._upperOpen
+                    );
+                }
+            } catch(err) {
+                throw new StorageError(`IDBKeyRange failed with data: ` + JSON.stringify(this), err);
+            }
+        }
+    }
+    /*
+     * @typedef   {Object} Gap
+     * @property  {?string} prev_batch the pagination token for this backwards facing gap
+     * @property  {?string} next_batch the pagination token for this forwards facing gap
+     *
+     * @typedef   {Object} Event
+     * @property  {string} event_id the id of the event
+     * @property  {string} type the
+     * @property  {?string} state_key the state key of this state event
+     *
+     * @typedef   {Object} Entry
+     * @property  {string} roomId
+     * @property  {EventKey} eventKey
+     * @property  {?Event} event if an event entry, the event
+     * @property  {?Gap} gap if a gap entry, the gap
+    */
+    class TimelineEventStore {
+        constructor(timelineStore) {
+            this._timelineStore = timelineStore;
+        }
+
+        /** Creates a range that only includes the given key
+         *  @param {EventKey} eventKey the key
+         *  @return {Range} the created range
+         */
+        onlyRange(eventKey) {
+            return new Range(eventKey);
+        }
+
+        /** Creates a range that includes all keys before eventKey, and optionally also the key itself.
+         *  @param {EventKey} eventKey the key
+         *  @param {boolean} [open=false] whether the key is included (false) or excluded (true) from the range at the upper end.
+         *  @return {Range} the created range
+         */
+        upperBoundRange(eventKey, open=false) {
+            return new Range(undefined, undefined, eventKey, undefined, open);
+        }
+
+        /** Creates a range that includes all keys after eventKey, and optionally also the key itself.
+         *  @param {EventKey} eventKey the key
+         *  @param {boolean} [open=false] whether the key is included (false) or excluded (true) from the range at the lower end.
+         *  @return {Range} the created range
+         */
+        lowerBoundRange(eventKey, open=false) {
+            return new Range(undefined, eventKey, undefined, open);
+        }
+
+        /** Creates a range that includes all keys between `lower` and `upper`, and optionally the given keys as well.
+         *  @param {EventKey} lower the lower key
+         *  @param {EventKey} upper the upper key
+         *  @param {boolean} [lowerOpen=false] whether the lower key is included (false) or excluded (true) from the range.
+         *  @param {boolean} [upperOpen=false] whether the upper key is included (false) or excluded (true) from the range.
+         *  @return {Range} the created range
+         */
+        boundRange(lower, upper, lowerOpen=false, upperOpen=false) {
+            return new Range(undefined, lower, upper, lowerOpen, upperOpen);
+        }
+
+        /** Looks up the last `amount` entries in the timeline for `roomId`.
+         *  @param  {string} roomId
+         *  @param  {number} fragmentId
+         *  @param  {number} amount
+         *  @return {Promise<Entry[]>} a promise resolving to an array with 0 or more entries, in ascending order.
+         */
+        async lastEvents(roomId, fragmentId, amount) {
+            const eventKey = EventKey.maxKey;
+            eventKey.fragmentId = fragmentId;
+            return this.eventsBefore(roomId, eventKey, amount);
+        }
+
+        /** Looks up the first `amount` entries in the timeline for `roomId`.
+         *  @param  {string} roomId
+         *  @param  {number} fragmentId
+         *  @param  {number} amount
+         *  @return {Promise<Entry[]>} a promise resolving to an array with 0 or more entries, in ascending order.
+         */
+        async firstEvents(roomId, fragmentId, amount) {
+            const eventKey = EventKey.minKey;
+            eventKey.fragmentId = fragmentId;
+            return this.eventsAfter(roomId, eventKey, amount);
+        }
+
+        /** Looks up `amount` entries after `eventKey` in the timeline for `roomId` within the same fragment.
+         *  The entry for `eventKey` is not included.
+         *  @param  {string} roomId
+         *  @param  {EventKey} eventKey
+         *  @param  {number} amount
+         *  @return {Promise<Entry[]>} a promise resolving to an array with 0 or more entries, in ascending order.
+         */
+        eventsAfter(roomId, eventKey, amount) {
+            const idbRange = this.lowerBoundRange(eventKey, true).asIDBKeyRange(roomId);
+            return this._timelineStore.selectLimit(idbRange, amount);
+        }
+
+        /** Looks up `amount` entries before `eventKey` in the timeline for `roomId` within the same fragment.
+         *  The entry for `eventKey` is not included.
+         *  @param  {string} roomId
+         *  @param  {EventKey} eventKey
+         *  @param  {number} amount
+         *  @return {Promise<Entry[]>} a promise resolving to an array with 0 or more entries, in ascending order.
+         */
+        async eventsBefore(roomId, eventKey, amount) {
+            const range = this.upperBoundRange(eventKey, true).asIDBKeyRange(roomId);
+            const events = await this._timelineStore.selectLimitReverse(range, amount);
+            events.reverse(); // because we fetched them backwards
+            return events;
+        }
+
+        /** Finds the first eventId that occurs in the store, if any.
+         *  For optimal performance, `eventIds` should be in chronological order.
+         *
+         *  The order in which results are returned might be different than `eventIds`.
+         *  Call the return value to obtain the next {id, event} pair.
+         *  @param  {string} roomId
+         *  @param  {string[]} eventIds
+         *  @return {Function<Promise>}
+         */
+        // performance comment from above refers to the fact that there *might*
+        // be a correlation between event_id sorting order and chronology.
+        // In that case we could avoid running over all eventIds, as the reported order by findExistingKeys
+        // would match the order of eventIds. That's why findLast is also passed as backwards to keysExist.
+        // also passing them in chronological order makes sense as that's how we'll receive them almost always.
+        async findFirstOccurringEventId(roomId, eventIds) {
+            const byEventId = this._timelineStore.index("byEventId");
+            const keys = eventIds.map(eventId => encodeEventIdKey(roomId, eventId));
+            const results = new Array(keys.length);
+            let firstFoundKey;
+
+            // find first result that is found and has no undefined results before it
+            function firstFoundAndPrecedingResolved() {
+                for(let i = 0; i < results.length; ++i) {
+                    if (results[i] === undefined) {
+                        return;
+                    } else if(results[i] === true) {
+                        return keys[i];
+                    }
+                }
+            }
+
+            await byEventId.findExistingKeys(keys, false, (key, found) => {
+                const index = keys.indexOf(key);
+                results[index] = found;
+                firstFoundKey = firstFoundAndPrecedingResolved();
+                return !!firstFoundKey;
+            });
+            return firstFoundKey && decodeEventIdKey(firstFoundKey).eventId;
+        }
+
+        /** Inserts a new entry into the store. The combination of roomId and eventKey should not exist yet, or an error is thrown.
+         *  @param  {Entry} entry the entry to insert
+         *  @return {Promise<>} a promise resolving to undefined if the operation was successful, or a StorageError if not.
+         *  @throws {StorageError} ...
+         */
+        insert(entry) {
+            entry.key = encodeKey(entry.roomId, entry.fragmentId, entry.eventIndex);
+            entry.eventIdKey = encodeEventIdKey(entry.roomId, entry.event.event_id);
+            // TODO: map error? or in idb/store?
+            return this._timelineStore.add(entry);
+        }
+
+        /** Updates the entry into the store with the given [roomId, eventKey] combination.
+         *  If not yet present, will insert. Might be slower than add.
+         *  @param  {Entry} entry the entry to update.
+         *  @return {Promise<>} a promise resolving to undefined if the operation was successful, or a StorageError if not.
+         */
+        update(entry) {
+            return this._timelineStore.put(entry);
+        }
+
+        get(roomId, eventKey) {
+            return this._timelineStore.get(encodeKey(roomId, eventKey.fragmentId, eventKey.eventIndex));
+        }
+        // returns the entries as well!! (or not always needed? I guess not always needed, so extra method)
+        removeRange(roomId, range) {
+            // TODO: read the entries!
+            return this._timelineStore.delete(range.asIDBKeyRange(roomId));
+        }
+
+        getByEventId(roomId, eventId) {
+            return this._timelineStore.index("byEventId").get(encodeEventIdKey(roomId, eventId));
+        }
+    }
+
+    class RoomStateStore {
+    	constructor(idbStore) {
+    		this._roomStateStore = idbStore;
+    	}
+
+    	async getEvents(type) {
+
+    	}
+
+    	async getEventsForKey(type, stateKey) {
+
+    	}
+
+    	async setStateEvent(roomId, event) {
+            const key = `${roomId}|${event.type}|${event.state_key}`;
+            const entry = {roomId, event, key};
+    		return this._roomStateStore.put(entry);
+    	}
+    }
+
+    function encodeKey$1(roomId, fragmentId) {
+        return `${roomId}|${encodeUint32(fragmentId)}`;
+    }
+
+    class TimelineFragmentStore {
+        constructor(store) {
+            this._store = store;
+        }
+
+        _allRange(roomId) {
+            try {
+                return IDBKeyRange.bound(
+                    encodeKey$1(roomId, WebPlatform.minStorageKey),
+                    encodeKey$1(roomId, WebPlatform.maxStorageKey)
+                );
+            } catch (err) {
+                throw new StorageError(`error from IDBKeyRange with roomId ${roomId}`, err);
+            }
+        }
+
+        all(roomId) {
+            return this._store.selectAll(this._allRange(roomId));
+        }
+
+        /** Returns the fragment without a nextToken and without nextId,
+        if any, with the largest id if there are multiple (which should not happen) */
+        liveFragment(roomId) {
+            // why do we need this?
+            // Ok, take the case where you've got a /context fragment and a /sync fragment
+            // They are not connected. So, upon loading the persister, which one do we take? We can't sort them ...
+            // we assume that the one without a nextToken and without a nextId is a live one
+            // there should really be only one like this
+
+            // reverse because assuming live fragment has bigger id than non-live ones
+            return this._store.findReverse(this._allRange(roomId), fragment => {
+                return typeof fragment.nextId !== "number" && typeof fragment.nextToken !== "string";
+            });
+        }
+
+        // should generate an id an return it?
+        // depends if we want to do anything smart with fragment ids,
+        // like give them meaning depending on range. not for now probably ...
+        add(fragment) {
+            fragment.key = encodeKey$1(fragment.roomId, fragment.id);
+            return this._store.add(fragment);
+        }
+
+        update(fragment) {
+            return this._store.put(fragment);
+        }
+
+        get(roomId, fragmentId) {
+            return this._store.get(encodeKey$1(roomId, fragmentId));
+        }
+    }
+
+    function encodeKey$2(roomId, queueIndex) {
+        return `${roomId}|${encodeUint32(queueIndex)}`;
+    }
+
+    function decodeKey(key) {
+        const [roomId, encodedQueueIndex] = key.split("|");
+        const queueIndex = decodeUint32(encodedQueueIndex);
+        return {roomId, queueIndex};
+    }
+
+    class PendingEventStore {
+        constructor(eventStore) {
+            this._eventStore = eventStore;
+        }
+
+        async getMaxQueueIndex(roomId) {
+            const range = IDBKeyRange.bound(
+                encodeKey$2(roomId, WebPlatform.minStorageKey),
+                encodeKey$2(roomId, WebPlatform.maxStorageKey),
+                false,
+                false,
+            );
+            const maxKey = await this._eventStore.findMaxKey(range);
+            if (maxKey) {
+                return decodeKey(maxKey).queueIndex;
+            }
+        }
+
+        remove(roomId, queueIndex) {
+            const keyRange = IDBKeyRange.only(encodeKey$2(roomId, queueIndex));
+            this._eventStore.delete(keyRange);
+        }
+
+        async exists(roomId, queueIndex) {
+            const keyRange = IDBKeyRange.only(encodeKey$2(roomId, queueIndex));
+            let key;
+            if (this._eventStore.supports("getKey")) {
+                key = await this._eventStore.getKey(keyRange);
+            } else {
+                const value = await this._eventStore.get(keyRange);
+                key = value && value.key;
+            }
+            return !!key;
+        }
+        
+        add(pendingEvent) {
+            pendingEvent.key = encodeKey$2(pendingEvent.roomId, pendingEvent.queueIndex);
+            return this._eventStore.add(pendingEvent);
+        }
+
+        update(pendingEvent) {
+            return this._eventStore.put(pendingEvent);
+        }
+
+        getAll() {
+            return this._eventStore.selectAll();
+        }
+    }
+
+    class Transaction {
+        constructor(txn, allowedStoreNames) {
+            this._txn = txn;
+            this._allowedStoreNames = allowedStoreNames;
+            this._stores = {
+                session: null,
+                roomSummary: null,
+                roomTimeline: null,
+                roomState: null,
+            };
+        }
+
+        _idbStore(name) {
+            if (!this._allowedStoreNames.includes(name)) {
+                // more specific error? this is a bug, so maybe not ...
+                throw new StorageError(`Invalid store for transaction: ${name}, only ${this._allowedStoreNames.join(", ")} are allowed.`);
+            }
+            return new Store(this._txn.objectStore(name));
+        }
+
+        _store(name, mapStore) {
+            if (!this._stores[name]) {
+                const idbStore = this._idbStore(name);
+                this._stores[name] = mapStore(idbStore);
+            }
+            return this._stores[name];
+        }
+
+        get session() {
+            return this._store("session", idbStore => new SessionStore(idbStore));
+        }
+
+        get roomSummary() {
+            return this._store("roomSummary", idbStore => new RoomSummaryStore(idbStore));
+        }
+
+        get timelineFragments() {
+            return this._store("timelineFragments", idbStore => new TimelineFragmentStore(idbStore));
+        }
+
+        get timelineEvents() {
+            return this._store("timelineEvents", idbStore => new TimelineEventStore(idbStore));
+        }
+
+        get roomState() {
+            return this._store("roomState", idbStore => new RoomStateStore(idbStore));
+        }
+
+        get pendingEvents() {
+            return this._store("pendingEvents", idbStore => new PendingEventStore(idbStore));
+        }
+
+        complete() {
+            return txnAsPromise(this._txn);
+        }
+
+        abort() {
+            this._txn.abort();
+        }
+    }
+
+    class Storage {
+        constructor(idbDatabase) {
+            this._db = idbDatabase;
+            const nameMap = STORE_NAMES.reduce((nameMap, name) => {
+                nameMap[name] = name;
+                return nameMap;
+            }, {});
+            this.storeNames = Object.freeze(nameMap);
+        }
+
+        _validateStoreNames(storeNames) {
+            const idx = storeNames.findIndex(name => !STORE_NAMES.includes(name));
+            if (idx !== -1) {
+                throw new StorageError(`Tried top, a transaction unknown store ${storeNames[idx]}`);
+            }
+        }
+
+        async readTxn(storeNames) {
+            this._validateStoreNames(storeNames);
+            try {
+                const txn = this._db.transaction(storeNames, "readonly");
+                return new Transaction(txn, storeNames);
+            } catch(err) {
+                throw new StorageError("readTxn failed", err);
+            }
+        }
+
+        async readWriteTxn(storeNames) {
+            this._validateStoreNames(storeNames);
+            try {
+                const txn = this._db.transaction(storeNames, "readwrite");
+                return new Transaction(txn, storeNames);
+            } catch(err) {
+                throw new StorageError("readWriteTxn failed", err);
+            }
+        }
+
+        close() {
+            this._db.close();
+        }
+    }
+
+    async function exportSession(db) {
+        const NOT_DONE = {done: false};
+        const txn = db.transaction(STORE_NAMES, "readonly");
+        const data = {};
+        await Promise.all(STORE_NAMES.map(async name => {
+            const results = data[name] = [];  // initialize in deterministic order
+            const store = txn.objectStore(name);
+            await iterateCursor(store.openCursor(), (value) => {
+                results.push(value);
+                return NOT_DONE;
+            });
+        }));
+        return data;
+    }
+
+    async function importSession(db, data) {
+        const txn = db.transaction(STORE_NAMES, "readwrite");
+        for (const name of STORE_NAMES) {
+            const store = txn.objectStore(name);
+            for (const value of data[name]) {
+                store.add(value);
+            }
+        }
+        await txnAsPromise(txn);
+    }
+
+    const sessionName = sessionId => `brawl_session_${sessionId}`;
+    const openDatabaseWithSessionId = sessionId => openDatabase(sessionName(sessionId), createStores, 1);
+
+    class StorageFactory {
+        async create(sessionId) {
+            const db = await openDatabaseWithSessionId(sessionId);
+            return new Storage(db);
+        }
+
+        delete(sessionId) {
+            const databaseName = sessionName(sessionId);
+            const req = window.indexedDB.deleteDatabase(databaseName);
+            return reqAsPromise(req);
+        }
+
+        async export(sessionId) {
+            const db = await openDatabaseWithSessionId(sessionId);
+            return await exportSession(db);
+        }
+
+        async import(sessionId, data) {
+            const db = await openDatabaseWithSessionId(sessionId);
+            return await importSession(db, data);
+        }
+    }
+
+    function createStores(db) {
+        db.createObjectStore("session", {keyPath: "key"});
+        // any way to make keys unique here? (just use put?)
+        db.createObjectStore("roomSummary", {keyPath: "roomId"});
+
+        // need index to find live fragment? prooobably ok without for now
+        //key = room_id | fragment_id
+        db.createObjectStore("timelineFragments", {keyPath: "key"});
+        //key = room_id | fragment_id | event_index
+        const timelineEvents = db.createObjectStore("timelineEvents", {keyPath: "key"});
+        //eventIdKey = room_id | event_id
+        timelineEvents.createIndex("byEventId", "eventIdKey", {unique: true});
+        //key = room_id | event.type | event.state_key,
+        db.createObjectStore("roomState", {keyPath: "key"});
+        db.createObjectStore("pendingEvents", {keyPath: "key"});
+        
+        // const roomMembers = db.createObjectStore("roomMembers", {keyPath: [
+        //  "event.room_id",
+        //  "event.content.membership",
+        //  "event.state_key"
+        // ]});
+        // roomMembers.createIndex("byName", ["room_id", "content.name"]);
+    }
+
+    class SessionInfoStorage {
+        constructor(name) {
+            this._name = name;
+        }
+
+        getAll() {
+            const sessionsJson = localStorage.getItem(this._name);
+            if (sessionsJson) {
+                const sessions = JSON.parse(sessionsJson);
+                if (Array.isArray(sessions)) {
+                    return Promise.resolve(sessions);
+                }
+            }
+            return Promise.resolve([]);
+        }
+
+        async hasAnySession() {
+            const all = await this.getAll();
+            return all && all.length > 0;
+        }
+
+        async updateLastUsed(id, timestamp) {
+            const sessions = await this.getAll();
+            if (sessions) {
+                const session = sessions.find(session => session.id === id);
+                if (session) {
+                    session.lastUsed = timestamp;
+                    localStorage.setItem(this._name, JSON.stringify(sessions));
+                }
+            }
+        }
+
+        async get(id) {
+            const sessions = await this.getAll();
+            if (sessions) {
+                return sessions.find(session => session.id === id);
+            }
+        }
+
+        async add(sessionInfo) {
+            const sessions = await this.getAll();
+            sessions.push(sessionInfo);
+            localStorage.setItem(this._name, JSON.stringify(sessions));
+        }
+
+        async delete(sessionId) {
+            let sessions = await this.getAll();
+            sessions = sessions.filter(s => s.id !== sessionId);
+            localStorage.setItem(this._name, JSON.stringify(sessions));
+        }
+        
     }
 
     function avatarInitials(name) {
@@ -4214,7 +4804,7 @@ var main = (function () {
         }
     }
 
-    class RoomNameTile$1 extends SimpleTile {
+    class RoomMemberTile extends SimpleTile {
 
         get shape() {
             return "announcement";
@@ -4256,7 +4846,7 @@ var main = (function () {
         }
     }
 
-    function tilesCreator ({room, ownUserId}) {
+    function tilesCreator({room, ownUserId}) {
         return function tilesCreator(entry, emitUpdate) {
             const options = {entry, emitUpdate, ownUserId};
             if (entry.isGap) {
@@ -4284,7 +4874,7 @@ var main = (function () {
                     case "m.room.name":
                         return new RoomNameTile(options);
                     case "m.room.member":
-                        return new RoomNameTile$1(options);
+                        return new RoomMemberTile(options);
                     default:
                         // unknown type not rendered
                         return null;
@@ -4311,7 +4901,7 @@ var main = (function () {
     */
 
     class TimelineViewModel {
-        constructor(room, timeline, ownUserId) {
+        constructor({room, timeline, ownUserId}) {
             this._timeline = timeline;
             // once we support sending messages we could do
             // timeline.entries.concat(timeline.pendingEvents)
@@ -4343,9 +4933,111 @@ var main = (function () {
         }
     }
 
-    class RoomViewModel extends EventEmitter {
-        constructor({room, ownUserId, closeCallback}) {
+    function disposeValue(value) {
+        if (typeof value === "function") {
+            value();
+        } else {
+            value.dispose();
+        }
+    }
+
+    class Disposables {
+        constructor() {
+            this._disposables = [];
+        }
+
+        track(disposable) {
+            this._disposables.push(disposable);
+        }
+
+        dispose() {
+            if (this._disposables) {
+                for (const d of this._disposables) {
+                    disposeValue(d);
+                }
+                this._disposables = null;
+            }
+        }
+
+        disposeTracked(value) {
+            if (value === undefined || value === null) {
+                return null;
+            }
+            const idx = this._disposables.indexOf(value);
+            if (idx !== -1) {
+                const [foundValue] = this._disposables.splice(idx, 1);
+                disposeValue(foundValue);
+            } else {
+                console.warn("disposable not found, did it leak?", value);
+            }
+            return null;
+        }
+    }
+
+    // ViewModel should just be an eventemitter, not an ObservableValue
+
+    class ViewModel extends EventEmitter {
+        constructor({clock} = {}) {
             super();
+            this.disposables = null;
+            this._options = {clock};
+        }
+
+        childOptions(explicitOptions) {
+            return Object.assign({}, this._options, explicitOptions);
+        }
+
+        track(disposable) {
+            if (!this.disposables) {
+                this.disposables = new Disposables();
+            }
+            this.disposables.track(disposable);
+            return disposable;
+        }
+
+        dispose() {
+            if (this.disposables) {
+                this.disposables.dispose();
+            }
+        }
+
+        disposeTracked(disposable) {
+            if (this.disposables) {
+                return this.disposables.disposeTracked(disposable);
+            }
+            return null;
+        }
+
+        // TODO: this will need to support binding
+        // if any of the expr is a function, assume the function is a binding, and return a binding function ourselves
+        // 
+        // translated string should probably always be bindings, unless we're fine with a refresh when changing the language?
+        // we probably are, if we're using routing with a url, we could just refresh.
+        i18n(parts, ...expr) {
+            // just concat for now
+            let result = "";
+            for (let i = 0; i < parts.length; ++i) {
+                result = result + parts[i];
+                if (i < expr.length) {
+                    result = result + expr[i];
+                }
+            }
+            return result;
+        }
+
+        emitChange(changedProps) {
+            this.emit("change", changedProps);
+        }
+
+        get clock() {
+            return this._options.clock;
+        }
+    }
+
+    class RoomViewModel extends ViewModel {
+        constructor(options) {
+            super(options);
+            const {room, ownUserId, closeCallback} = options;
             this._room = room;
             this._ownUserId = ownUserId;
             this._timeline = null;
@@ -4354,18 +5046,23 @@ var main = (function () {
             this._timelineError = null;
             this._sendError = null;
             this._closeCallback = closeCallback;
+            this._composerVM = new ComposerViewModel(this);
         }
 
         async load() {
             this._room.on("change", this._onRoomChange);
             try {
                 this._timeline = await this._room.openTimeline();
-                this._timelineVM = new TimelineViewModel(this._room, this._timeline, this._ownUserId);
-                this.emit("change", "timelineViewModel");
+                this._timelineVM = new TimelineViewModel(this.childOptions({
+                    room: this._room,
+                    timeline: this._timeline,
+                    ownUserId: this._ownUserId,
+                }));
+                this.emitChange("timelineViewModel");
             } catch (err) {
                 console.error(`room.openTimeline(): ${err.message}:\n${err.stack}`);
                 this._timelineError = err;
-                this.emit("change", "error");
+                this.emitChange("error");
             }
         }
 
@@ -4384,7 +5081,7 @@ var main = (function () {
         // room doesn't tell us yet which fields changed,
         // so emit all fields originating from summary
         _onRoomChange() {
-            this.emit("change", "name");
+            this.emitChange("name");
         }
 
         get name() {
@@ -4409,7 +5106,9 @@ var main = (function () {
             return avatarInitials(this._room.name);
         }
 
-        async sendMessage(message) {
+
+        
+        async _sendMessage(message) {
             if (message) {
                 try {
                     await this._room.sendEvent("m.room.message", {msgtype: "m.text", body: message});
@@ -4417,70 +5116,148 @@ var main = (function () {
                     console.error(`room.sendMessage(): ${err.message}:\n${err.stack}`);
                     this._sendError = err;
                     this._timelineError = null;
-                    this.emit("change", "error");
+                    this.emitChange("error");
                     return false;
                 }
                 return true;
             }
             return false;
         }
+
+        get composerViewModel() {
+            return this._composerVM;
+        }
     }
 
-    class SyncStatusViewModel extends EventEmitter {
-        constructor(sync) {
-            super();
+    class ComposerViewModel {
+        constructor(roomVM) {
+            this._roomVM = roomVM;
+        }
+
+        sendMessage(message) {
+            return this._roomVM._sendMessage(message);
+        }
+    }
+
+    const SessionStatus = createEnum(
+        "Disconnected",
+        "Connecting",
+        "FirstSync",
+        "Sending",
+        "Syncing",
+        "SyncError"
+    );
+
+    class SessionStatusViewModel extends ViewModel {
+        constructor(options) {
+            super(options);
+            const {sync, reconnector} = options;
             this._sync = sync;
-            this._onStatus = this._onStatus.bind(this);
+            this._reconnector = reconnector;
+            this._status = this._calculateState(reconnector.connectionStatus.get(), sync.status.get());
+            
         }
 
-        _onStatus(status, err) {
-            if (status === "error") {
-                this._error = err;
-            } else if (status === "started") {
-                this._error = null;
-            }
-            this.emit("change");
+        start() {
+            const update = () => this._updateStatus();
+            this.track(this._sync.status.subscribe(update));
+            this.track(this._reconnector.connectionStatus.subscribe(update));
         }
 
-        onFirstSubscriptionAdded(name) {
-            if (name === "change") {
-                this._sync.on("status", this._onStatus);
-            }
+        get isShown() {
+            return this._status !== SessionStatus.Syncing;
         }
 
-        onLastSubscriptionRemoved(name) {
-            if (name === "change") {
-                this._sync.on("status", this._onStatus);
-            }
-        }
-
-        trySync() {
-            this._sync.start();
-            this.emit("change");
-        }
-
-        get status() {
-            if (!this.isSyncing) {
-                if (this._error) {
-                    return `Error while syncing: ${this._error.message}`;
-                } else {
-                    return "Sync stopped";
+        get statusLabel() {
+            switch (this._status) {
+                case SessionStatus.Disconnected:{
+                    const retryIn = Math.round(this._reconnector.retryIn / 1000);
+                    return this.i18n`Disconnected, trying to reconnect in ${retryIn}s…`;
                 }
-            } else {
-                return "Sync running";
+                case SessionStatus.Connecting:
+                    return this.i18n`Trying to reconnect now…`;
+                case SessionStatus.FirstSync:
+                    return this.i18n`Catching up with your conversations…`;
+                case SessionStatus.SyncError:
+                    return this.i18n`Sync failed because of ${this._sync.error}`;
+            }
+            return "";
+        }
+
+        get isWaiting() {
+            switch (this._status) {
+                case SessionStatus.Connecting:
+                case SessionStatus.FirstSync:
+                    return true;
+                default:
+                    return false;
             }
         }
 
-        get isSyncing() {
-            return this._sync.isSyncing;
+        _updateStatus() {
+            const newStatus = this._calculateState(
+                this._reconnector.connectionStatus.get(),
+                this._sync.status.get()
+            );
+            if (newStatus !== this._status) {
+                if (newStatus === SessionStatus.Disconnected) {
+                    this._retryTimer = this.track(this.clock.createInterval(() => {
+                        this.emitChange("statusLabel");
+                    }, 1000));
+                } else {
+                    this._retryTimer = this.disposeTracked(this._retryTimer);
+                }
+                this._status = newStatus;
+                console.log("newStatus", newStatus);
+                this.emitChange();
+            }
+        }
+
+        _calculateState(connectionStatus, syncStatus) {
+            if (connectionStatus !== ConnectionStatus.Online) {
+                switch (connectionStatus) {
+                    case ConnectionStatus.Reconnecting:
+                        return SessionStatus.Connecting;
+                    case ConnectionStatus.Waiting:
+                        return SessionStatus.Disconnected;
+                }
+            } else if (syncStatus !== SyncStatus.Syncing) {
+                switch (syncStatus) {
+                    // InitialSync should be awaited in the SessionLoadViewModel,
+                    // but include it here anyway
+                    case SyncStatus.InitialSync:
+                    case SyncStatus.CatchupSync:
+                        return SessionStatus.FirstSync;
+                    case SyncStatus.Stopped:
+                        return SessionStatus.SyncError;
+                }
+            } /* else if (session.pendingMessageCount) {
+                return SessionStatus.Sending;
+            } */ else {
+                return SessionStatus.Syncing;
+            }
+        }
+
+        get isConnectNowShown() {
+            return this._status === SessionStatus.Disconnected;
+        }
+
+        connectNow() {
+            if (this.isConnectNowShown) {
+                this._reconnector.tryNow();
+            }
         }
     }
 
-    class SessionViewModel extends EventEmitter {
-        constructor({session, sync}) {
-            super();
-            this._session = session;
-            this._syncStatusViewModel = new SyncStatusViewModel(sync);
+    class SessionViewModel extends ViewModel {
+        constructor(options) {
+            super(options);
+            const {sessionContainer} = options;
+            this._session = sessionContainer.session;
+            this._sessionStatusViewModel = this.track(new SessionStatusViewModel(this.childOptions({
+                sync: sessionContainer.sync,
+                reconnector: sessionContainer.reconnector
+            })));
             this._currentRoomViewModel = null;
             const roomTileVMs = this._session.rooms.mapValues((room, emitUpdate) => {
                 return new RoomTileViewModel({
@@ -4492,8 +5269,12 @@ var main = (function () {
             this._roomList = roomTileVMs.sortValues((a, b) => a.compare(b));
         }
 
-        get syncStatusViewModel() {
-            return this._syncStatusViewModel;
+        start() {
+            this._sessionStatusViewModel.start();
+        }
+
+        get sessionStatusViewModel() {
+            return this._sessionStatusViewModel;
         }
 
         get roomList() {
@@ -4506,67 +5287,209 @@ var main = (function () {
 
         _closeCurrentRoom() {
             if (this._currentRoomViewModel) {
-                this._currentRoomViewModel.dispose();
-                this._currentRoomViewModel = null;
-                this.emit("change", "currentRoom");
+                this._currentRoomViewModel = this.disposeTracked(this._currentRoomViewModel);
+                this.emitChange("currentRoom");
             }
         }
 
         _openRoom(room) {
             if (this._currentRoomViewModel) {
-                this._currentRoomViewModel.dispose();
+                this._currentRoomViewModel = this.disposeTracked(this._currentRoomViewModel);
             }
-            this._currentRoomViewModel = new RoomViewModel({
+            this._currentRoomViewModel = this.track(new RoomViewModel(this.childOptions({
                 room,
                 ownUserId: this._session.user.id,
                 closeCallback: () => this._closeCurrentRoom(),
-            });
+            })));
             this._currentRoomViewModel.load();
-            this.emit("change", "currentRoom");
+            this.emitChange("currentRoom");
         }
     }
 
-    class LoginViewModel extends EventEmitter {
-        constructor({loginCallback, defaultHomeServer, createHsApi}) {
-            super();
-            this._loginCallback = loginCallback;
-            this._defaultHomeServer = defaultHomeServer;
-            this._createHsApi = createHsApi;
+    class SessionLoadViewModel extends ViewModel {
+        constructor(options) {
+            super(options);
+            const {createAndStartSessionContainer, sessionCallback, homeserver, deleteSessionOnCancel} = options;
+            this._createAndStartSessionContainer = createAndStartSessionContainer;
+            this._sessionCallback = sessionCallback;
+            this._homeserver = homeserver;
+            this._deleteSessionOnCancel = deleteSessionOnCancel;
             this._loading = false;
             this._error = null;
         }
 
-        get usernamePlaceholder() { return "Username"; }
-        get passwordPlaceholder() { return "Password"; }
-        get hsPlaceholder() { return "Your matrix homeserver"; }
-        get defaultHomeServer() { return this._defaultHomeServer; }
-        get error() { return this._error; }
-        get loading() { return this._loading; }
-
-        async login(username, password, homeserver) {
-            const hsApi = this._createHsApi(homeserver);
+        async start() {
+            if (this._loading) {
+                return;
+            }
             try {
                 this._loading = true;
-                this.emit("change", "loading");
-                const loginData = await hsApi.passwordLogin(username, password).response();
-                loginData.homeServerUrl = homeserver;
-                this._loginCallback(loginData);
-                // wait for parent view model to switch away here
+                this.emitChange();
+                this._sessionContainer = this._createAndStartSessionContainer();
+                this._waitHandle = this._sessionContainer.loadStatus.waitFor(s => {
+                    this.emitChange();
+                    // wait for initial sync, but not catchup sync
+                    const isCatchupSync = s === LoadStatus.FirstSync &&
+                        this._sessionContainer.sync.status.get() === SyncStatus.CatchupSync;
+                    return isCatchupSync ||
+                        s === LoadStatus.LoginFailed ||
+                        s === LoadStatus.Error ||
+                        s === LoadStatus.Ready;
+                });
+                try {
+                    await this._waitHandle.promise;
+                } catch (err) {
+                    return; // aborted by goBack
+                }
+                // TODO: should we deal with no connection during initial sync 
+                // and we're retrying as well here?
+                // e.g. show in the label what is going on wrt connectionstatus
+                // much like we will once you are in the app. Probably a good idea
+
+                // did it finish or get stuck at LoginFailed or Error?
+                const loadStatus = this._sessionContainer.loadStatus.get();
+                if (loadStatus === LoadStatus.FirstSync || loadStatus === LoadStatus.Ready) {
+                    this._sessionCallback(this._sessionContainer);
+                }
             } catch (err) {
                 this._error = err;
+            } finally {
                 this._loading = false;
-                this.emit("change", "loading");
+                this.emitChange();
             }
         }
 
-        cancel() {
-            this._loginCallback();
+
+        async cancel() {
+            try {
+                if (this._sessionContainer) {
+                    this._sessionContainer.stop();
+                    if (this._deleteSessionOnCancel) {
+                        await this._sessionContainer.deletSession();
+                    }
+                    this._sessionContainer = null;
+                }
+                if (this._waitHandle) {
+                    // rejects with AbortError
+                    this._waitHandle.dispose();
+                    this._waitHandle = null;
+                }
+                this._sessionCallback();
+            } catch (err) {
+                this._error = err;
+                this.emitChange();
+            }
+        }
+
+        // to show a spinner or not
+        get loading() {
+            return this._loading;
+        }
+
+        get loadLabel() {
+            const sc = this._sessionContainer;
+            const error = this._error || (sc && sc.loadError);
+
+            if (error || (sc && sc.loadStatus.get() === LoadStatus.Error)) {
+                return `Something went wrong: ${error && error.message}.`;
+            }
+
+            if (sc) {
+                switch (sc.loadStatus.get()) {
+                    case LoadStatus.NotLoading:
+                        return `Preparing…`;
+                    case LoadStatus.Login:
+                        return `Checking your login and password…`;
+                    case LoadStatus.LoginFailed:
+                        switch (sc.loginFailure) {
+                            case LoginFailure.LoginFailure:
+                                return `Your username and/or password don't seem to be correct.`;
+                            case LoginFailure.Connection:
+                                return `Can't connect to ${this._homeserver}.`;
+                            case LoginFailure.Unknown:
+                                return `Something went wrong while checking your login and password.`;
+                        }
+                        break;
+                    case LoadStatus.Loading:
+                        return `Loading your conversations…`;
+                    case LoadStatus.FirstSync:
+                        return `Getting your conversations from the server…`;
+                    default:
+                        return this._sessionContainer.loadStatus.get();
+                }
+            }
+
+            return `Preparing…`;
         }
     }
 
-    class SessionItemViewModel extends EventEmitter {
+    class LoginViewModel extends ViewModel {
+        constructor(options) {
+            super(options);
+            const {sessionCallback, defaultHomeServer, createSessionContainer} = options;
+            this._createSessionContainer = createSessionContainer;
+            this._sessionCallback = sessionCallback;
+            this._defaultHomeServer = defaultHomeServer;
+            this._loadViewModel = null;
+            this._loadViewModelSubscription = null;
+        }
+
+        get defaultHomeServer() { return this._defaultHomeServer; }
+
+        get loadViewModel() {return this._loadViewModel; }
+
+        get isBusy() {
+            if (!this._loadViewModel) {
+                return false;
+            } else {
+                return this._loadViewModel.loading;
+            }
+        }
+
+        async login(username, password, homeserver) {
+            this._loadViewModelSubscription = this.disposeTracked(this._loadViewModelSubscription);
+            if (this._loadViewModel) {
+                this._loadViewModel.cancel();
+            }
+            this._loadViewModel = new SessionLoadViewModel({
+                createAndStartSessionContainer: () => {
+                    const sessionContainer = this._createSessionContainer();
+                    sessionContainer.startWithLogin(homeserver, username, password);
+                    return sessionContainer;
+                },
+                sessionCallback: sessionContainer => {
+                    if (sessionContainer) {
+                        // make parent view model move away
+                        this._sessionCallback(sessionContainer);
+                    } else {
+                        // show list of session again
+                        this._loadViewModel = null;
+                        this.emitChange("loadViewModel");
+                    }
+                },
+                deleteSessionOnCancel: true,
+                homeserver,
+            });
+            this._loadViewModel.start();
+            this.emitChange("loadViewModel");
+            this._loadViewModelSubscription = this.track(this._loadViewModel.disposableOn("change", () => {
+                if (!this._loadViewModel.loading) {
+                    this._loadViewModelSubscription = this.disposeTracked(this._loadViewModelSubscription);
+                }
+                this.emitChange("isBusy");
+            }));
+        }
+
+        cancel() {
+            if (!this.isBusy) {
+                this._sessionCallback();
+            }
+        }
+    }
+
+    class SessionItemViewModel extends ViewModel {
         constructor(sessionInfo, pickerVM) {
-            super();
+            super({});
             this._pickerVM = pickerVM;
             this._sessionInfo = sessionInfo;
             this._isDeleting = false;
@@ -4581,31 +5504,31 @@ var main = (function () {
 
         async delete() {
             this._isDeleting = true;
-            this.emit("change", "isDeleting");
+            this.emitChange("isDeleting");
             try {
                 await this._pickerVM.delete(this.id);
             } catch(err) {
                 this._error = err;
                 console.error(err);
-                this.emit("change", "error");
+                this.emitChange("error");
             } finally {
                 this._isDeleting = false;
-                this.emit("change", "isDeleting");
+                this.emitChange("isDeleting");
             }
         }
 
         async clear() {
             this._isClearing = true;
-            this.emit("change");
+            this.emitChange();
             try {
                 await this._pickerVM.clear(this.id);
             } catch(err) {
                 this._error = err;
                 console.error(err);
-                this.emit("change", "error");
+                this.emitChange("error");
             } finally {
                 this._isClearing = false;
-                this.emit("change", "isClearing");
+                this.emitChange("isClearing");
             }
         }
 
@@ -4644,7 +5567,7 @@ var main = (function () {
                 const json = JSON.stringify(data, undefined, 2);
                 const blob = new Blob([json], {type: "application/json"});
                 this._exportDataUrl = URL.createObjectURL(blob);
-                this.emit("change", "exportDataUrl");
+                this.emitChange("exportDataUrl");
             } catch (err) {
                 alert(err.message);
                 console.error(err);
@@ -4655,33 +5578,66 @@ var main = (function () {
             if (this._exportDataUrl) {
                 URL.revokeObjectURL(this._exportDataUrl);
                 this._exportDataUrl = null;
-                this.emit("change", "exportDataUrl");
+                this.emitChange("exportDataUrl");
             }
         }
     }
 
-    class SessionPickerViewModel {
-        constructor({storageFactory, sessionStore, sessionCallback}) {
+
+    class SessionPickerViewModel extends ViewModel {
+        constructor(options) {
+            super(options);
+            const {storageFactory, sessionInfoStorage, sessionCallback, createSessionContainer} = options;
             this._storageFactory = storageFactory;
-            this._sessionStore = sessionStore;
+            this._sessionInfoStorage = sessionInfoStorage;
             this._sessionCallback = sessionCallback;
+            this._createSessionContainer = createSessionContainer;
             this._sessions = new SortedArray((s1, s2) => s1.id.localeCompare(s2.id));
+            this._loadViewModel = null;
+            this._error = null;
         }
 
+        // this loads all the sessions
         async load() {
-            const sessions = await this._sessionStore.getAll();
+            const sessions = await this._sessionInfoStorage.getAll();
             this._sessions.setManyUnsorted(sessions.map(s => new SessionItemViewModel(s, this)));
         }
 
-        pick(id) {
+        // for the loading of 1 picked session
+        get loadViewModel() {
+            return this._loadViewModel;
+        }
+
+        async pick(id) {
+            if (this._loadViewModel) {
+                return;
+            }
             const sessionVM = this._sessions.array.find(s => s.id === id);
             if (sessionVM) {
-                this._sessionCallback(sessionVM.sessionInfo);
+                this._loadViewModel = new SessionLoadViewModel({
+                    createAndStartSessionContainer: () => {
+                        const sessionContainer = this._createSessionContainer();
+                        sessionContainer.startWithExistingSession(sessionVM.id);
+                        return sessionContainer;
+                    },
+                    sessionCallback: sessionContainer => {
+                        if (sessionContainer) {
+                            // make parent view model move away
+                            this._sessionCallback(sessionContainer);
+                        } else {
+                            // show list of session again
+                            this._loadViewModel = null;
+                            this.emitChange("loadViewModel");
+                        }
+                    }
+                });
+                this._loadViewModel.start();
+                this.emitChange("loadViewModel");
             }
         }
 
         async _exportData(id) {
-            const sessionInfo = await this._sessionStore.get(id);
+            const sessionInfo = await this._sessionInfoStorage.get(id);
             const stores = await this._storageFactory.export(id);
             const data = {sessionInfo, stores};
             return data;
@@ -4691,15 +5647,15 @@ var main = (function () {
             const data = JSON.parse(json);
             const {sessionInfo} = data;
             sessionInfo.comment = `Imported on ${new Date().toLocaleString()} from id ${sessionInfo.id}.`;
-            sessionInfo.id = createNewSessionId();
+            sessionInfo.id = this._createSessionContainer().createNewSessionId();
             await this._storageFactory.import(sessionInfo.id, data.stores);
-            await this._sessionStore.add(sessionInfo);
+            await this._sessionInfoStorage.add(sessionInfo);
             this._sessions.set(new SessionItemViewModel(sessionInfo, this));
         }
 
         async delete(id) {
             const idx = this._sessions.array.findIndex(s => s.id === id);
-            await this._sessionStore.delete(id);
+            await this._sessionInfoStorage.delete(id);
             await this._storageFactory.delete(id);
             this._sessions.remove(idx);
         }
@@ -4713,84 +5669,84 @@ var main = (function () {
         }
 
         cancel() {
-            this._sessionCallback();
+            if (!this._loadViewModel) {
+                this._sessionCallback();
+            }
         }
     }
 
-    function createNewSessionId() {
-        return (Math.floor(Math.random() * Number.MAX_SAFE_INTEGER)).toString();
-    }
-
-    class BrawlViewModel extends EventEmitter {
-        constructor({storageFactory, sessionStore, createHsApi, clock}) {
-            super();
+    class BrawlViewModel extends ViewModel {
+        constructor(options) {
+            super(options);
+            const {createSessionContainer, sessionInfoStorage, storageFactory} = options;
+            this._createSessionContainer = createSessionContainer;
+            this._sessionInfoStorage = sessionInfoStorage;
             this._storageFactory = storageFactory;
-            this._sessionStore = sessionStore;
-            this._createHsApi = createHsApi;
-            this._clock = clock;
 
-            this._loading = false;
             this._error = null;
             this._sessionViewModel = null;
             this._loginViewModel = null;
             this._sessionPickerViewModel = null;
+
+            this._sessionContainer = null;
+            this._sessionCallback = this._sessionCallback.bind(this);
         }
 
         async load() {
-            if (await this._sessionStore.hasAnySession()) {
+            if (await this._sessionInfoStorage.hasAnySession()) {
                 this._showPicker();
             } else {
                 this._showLogin();
             }
         }
 
+        _sessionCallback(sessionContainer) {
+            if (sessionContainer) {
+                this._setSection(() => {
+                    this._sessionContainer = sessionContainer;
+                    this._sessionViewModel = new SessionViewModel(this.childOptions({sessionContainer}));
+                    this._sessionViewModel.start();
+                });
+            } else {
+                // switch between picker and login
+                if (this.activeSection === "login") {
+                    this._showPicker();
+                } else {
+                    this._showLogin();
+                }
+            }
+        }
+
         async _showPicker() {
-            this._clearSections();
-            this._sessionPickerViewModel = new SessionPickerViewModel({
-                sessionStore: this._sessionStore,
-                storageFactory: this._storageFactory,
-                sessionCallback: sessionInfo => this._onSessionPicked(sessionInfo)
+            this._setSection(() => {
+                this._sessionPickerViewModel = new SessionPickerViewModel({
+                    sessionInfoStorage: this._sessionInfoStorage,
+                    storageFactory: this._storageFactory,
+                    createSessionContainer: this._createSessionContainer,
+                    sessionCallback: this._sessionCallback,
+                });
             });
-            this.emit("change", "activeSection");
             try {
                 await this._sessionPickerViewModel.load();
             } catch (err) {
-                this._clearSections();
-                this._error = err;
-                this.emit("change", "activeSection");
+                this._setSection(() => this._error = err);
             }
         }
 
         _showLogin() {
-            this._clearSections();
-            this._loginViewModel = new LoginViewModel({
-                createHsApi: this._createHsApi,
-                defaultHomeServer: "https://matrix.org",
-                loginCallback: loginData => this._onLoginFinished(loginData)
+            this._setSection(() => {
+                this._loginViewModel = new LoginViewModel({
+                    defaultHomeServer: "https://matrix.org",
+                    createSessionContainer: this._createSessionContainer,
+                    sessionCallback: this._sessionCallback,
+                });
             });
-            this.emit("change", "activeSection");
 
-        }
-
-        _showSession(session, sync) {
-            this._clearSections();
-            this._sessionViewModel = new SessionViewModel({session, sync});
-            this.emit("change", "activeSection");
-        }
-
-        _clearSections() {
-            this._error = null;
-            this._loading = false;
-            this._sessionViewModel = null;
-            this._loginViewModel = null;
-            this._sessionPickerViewModel = null;
         }
 
         get activeSection() {
             if (this._error) {
                 return "error";
-            } else if(this._loading) {
-                return "loading";
             } else if (this._sessionViewModel) {
                 return "session";
             } else if (this._loginViewModel) {
@@ -4800,78 +5756,26 @@ var main = (function () {
             }
         }
 
-        get loadingText() { return this._loadingText; }
+        _setSection(setter) {
+            // clear all members the activeSection depends on
+            this._error = null;
+            this._sessionViewModel = null;
+            this._loginViewModel = null;
+            this._sessionPickerViewModel = null;
+
+            if (this._sessionContainer) {
+                this._sessionContainer.stop();
+                this._sessionContainer = null;
+            }
+            // now set it again
+            setter();
+            this.emitChange("activeSection");
+        }
+
+        get error() { return this._error; }
         get sessionViewModel() { return this._sessionViewModel; }
         get loginViewModel() { return this._loginViewModel; }
         get sessionPickerViewModel() { return this._sessionPickerViewModel; }
-        get errorText() { return this._error && this._error.message; }
-
-        async _onLoginFinished(loginData) {
-            if (loginData) {
-                // TODO: extract random() as it is a source of non-determinism
-                const sessionId = createNewSessionId();
-                const sessionInfo = {
-                    id: sessionId,
-                    deviceId: loginData.device_id,
-                    userId: loginData.user_id,
-                    homeServer: loginData.homeServerUrl,
-                    accessToken: loginData.access_token,
-                    lastUsed: this._clock.now()
-                };
-                await this._sessionStore.add(sessionInfo);
-                this._loadSession(sessionInfo);
-            } else {
-                this._showPicker();
-            }
-        }
-
-        _onSessionPicked(sessionInfo) {
-            if (sessionInfo) {
-                this._loadSession(sessionInfo);
-                this._sessionStore.updateLastUsed(sessionInfo.id, this._clock.now());
-            } else {
-                this._showLogin();
-            }
-        }
-
-        async _loadSession(sessionInfo) {
-            try {
-                this._loading = true;
-                this._loadingText = "Loading your conversations…";
-                const hsApi = this._createHsApi(sessionInfo.homeServer, sessionInfo.accessToken);
-                const storage = await this._storageFactory.create(sessionInfo.id);
-                // no need to pass access token to session
-                const filteredSessionInfo = {
-                    deviceId: sessionInfo.deviceId,
-                    userId: sessionInfo.userId,
-                    homeServer: sessionInfo.homeServer,
-                };
-                const session = new Session({storage, sessionInfo: filteredSessionInfo, hsApi});
-                // show spinner now, with title loading stored data?
-
-                this.emit("change", "activeSection");
-                await session.load();
-                const sync = new Sync({hsApi, storage, session});            
-                
-                const needsInitialSync = !session.syncToken;
-                if (!needsInitialSync) {
-                    this._showSession(session, sync);
-                }
-                this._loadingText = "Getting your conversations from the server…";
-                this.emit("change", "loadingText");
-                // update spinner title to initial sync
-                await sync.start();
-                if (needsInitialSync) {
-                    this._showSession(session, sync);
-                }
-                // start sending pending messages
-                session.notifyNetworkAvailable();
-            } catch (err) {
-                console.error(err);
-                this._error = err;
-            }
-            this.emit("change", "activeSection");
-        }
     }
 
     // DOM helper functions
@@ -4908,13 +5812,13 @@ var main = (function () {
         }
     }
 
-    function el(elementName, attributes, children) {
+    function elNS(ns, elementName, attributes, children) {
         if (attributes && isChildren(attributes)) {
             children = attributes;
             attributes = null;
         }
 
-        const e = document.createElement(elementName);
+        const e = document.createElementNS(ns, elementName);
 
         if (attributes) {
             for (let [name, value] of Object.entries(attributes)) {
@@ -4943,17 +5847,26 @@ var main = (function () {
         return document.createTextNode(str);
     }
 
-    const TAG_NAMES = [
-        "a", "ol", "ul", "li", "div", "h1", "h2", "h3", "h4", "h5", "h6",
-        "p", "strong", "em", "span", "img", "section", "main", "article", "aside",
-        "pre", "button", "time", "input", "textarea"];
+    const HTML_NS = "http://www.w3.org/1999/xhtml";
+    const SVG_NS = "http://www.w3.org/2000/svg";
+
+    const TAG_NAMES = {
+        [HTML_NS]: [
+            "a", "ol", "ul", "li", "div", "h1", "h2", "h3", "h4", "h5", "h6",
+            "p", "strong", "em", "span", "img", "section", "main", "article", "aside",
+            "pre", "button", "time", "input", "textarea"],
+        [SVG_NS]: ["svg", "circle"]
+    };
 
     const tag = {};
 
-    for (const tagName of TAG_NAMES) {
-        tag[tagName] = function(attributes, children) {
-            return el(tagName, attributes, children);
-        };
+
+    for (const [ns, tags] of Object.entries(TAG_NAMES)) {
+        for (const tagName of tags) {
+            tag[tagName] = function(attributes, children) {
+                return elNS(ns, tagName, attributes, children);
+            };
+        }
     }
 
     function insertAt(parentNode, idx, childNode) {
@@ -4965,6 +5878,8 @@ var main = (function () {
             parentNode.insertBefore(childNode, nextDomNode);
         }
     }
+
+    const MOUNT_ARGS = {parentProvidesUpdates: true};
 
     class ListView {
         constructor({list, onItemClick, className}, childCreator) {
@@ -5009,7 +5924,9 @@ var main = (function () {
         }
 
         unmount() {
-            this._unloadList();
+            if (this._list) {
+                this._unloadList();
+            }
         }
 
         _onClick(event) {
@@ -5042,7 +5959,7 @@ var main = (function () {
             for (let item of this._list) {
                 const child = this._childCreator(item);
                 this._childInstances.push(child);
-                const childDomNode = child.mount();
+                const childDomNode = child.mount(MOUNT_ARGS);
                 this._root.appendChild(childDomNode);
             }
         }
@@ -5051,7 +5968,7 @@ var main = (function () {
             this.onBeforeListChanged();
             const child = this._childCreator(value);
             this._childInstances.splice(idx, 0, child);
-            insertAt(this._root, idx, child.mount());
+            insertAt(this._root, idx, child.mount(MOUNT_ARGS));
             this.onListChanged();
         }
 
@@ -5083,6 +6000,17 @@ var main = (function () {
         onListChanged() {}
     }
 
+    function errorToDOM(error) {
+        const stack = new Error().stack;
+        const callee = stack.split("\n")[1];
+        return tag.div([
+            tag.h2("Something went wrong…"),
+            tag.h3(error.message),
+            tag.p(`This occurred while running ${callee}.`),
+            tag.pre(error.stack),
+        ]);
+    }
+
     function objHasFns(obj) {
         for(const value of Object.values(obj)) {
             if (typeof value === "function") {
@@ -5101,47 +6029,39 @@ var main = (function () {
             - one way binding of text values (child fn value)
             - refs to get dom nodes
             - className binding returning object with className => enabled map
-        missing:
-            - create views
+            - add subviews inside the template
     */
-    class Template {
-        constructor(value, render) {
+    class TemplateView {
+        constructor(value, render = undefined) {
             this._value = value;
+            this._render = render;
             this._eventListeners = null;
             this._bindings = null;
-            this._subTemplates = null;
-            this._root = render(this, this._value);
-            this._attach();
+            // this should become _subViews and also include templates.
+            // How do we know which ones we should update though?
+            // Wrapper class?
+            this._subViews = null;
+            this._root = null;
+            this._boundUpdateFromValue = null;
         }
 
-        root() {
-            return this._root;
+        get value() {
+            return this._value;
         }
 
-        update(value) {
-            this._value = value;
-            if (this._bindings) {
-                for (const binding of this._bindings) {
-                    binding();
-                }
-            }
-            if (this._subTemplates) {
-                for (const sub of this._subTemplates) {
-                    sub.update(value);
-                }
+        _subscribe() {
+            if (typeof this._value.on === "function") {
+                this._boundUpdateFromValue = this._updateFromValue.bind(this);
+                this._value.on("change", this._boundUpdateFromValue);
             }
         }
 
-        dispose() {
-            if (this._eventListeners) {
-                for (let {node, name, fn} of this._eventListeners) {
-                    node.removeEventListener(name, fn);
+        _unsubscribe() {
+            if (this._boundUpdateFromValue) {
+                if (typeof this._value.off === "function") {
+                    this._value.off("change", this._boundUpdateFromValue);
                 }
-            }
-            if (this._subTemplates) {
-                for (const sub of this._subTemplates) {
-                    sub.dispose();
-                }
+                this._boundUpdateFromValue = null;
             }
         }
 
@@ -5149,6 +6069,58 @@ var main = (function () {
             if (this._eventListeners) {
                 for (let {node, name, fn} of this._eventListeners) {
                     node.addEventListener(name, fn);
+                }
+            }
+        }
+
+        _detach() {
+            if (this._eventListeners) {
+                for (let {node, name, fn} of this._eventListeners) {
+                    node.removeEventListener(name, fn);
+                }
+            }
+        }
+
+        mount(options) {
+            const builder = new TemplateBuilder(this);
+            if (this._render) {
+                this._root = this._render(builder, this._value);
+            } else if (this.render) {   // overriden in subclass
+                this._root = this.render(builder, this._value);
+            } else {
+                throw new Error("no render function passed in, or overriden in subclass");
+            }
+            const parentProvidesUpdates = options && options.parentProvidesUpdates;
+            if (!parentProvidesUpdates) {
+                this._subscribe();
+            }
+            this._attach();
+            return this._root;
+        }
+
+        unmount() {
+            this._detach();
+            this._unsubscribe();
+            if (this._subViews) {
+                for (const v of this._subViews) {
+                    v.unmount();
+                }
+            }
+        }
+
+        root() {
+            return this._root;
+        }
+
+        _updateFromValue(changedProps) {
+            this.update(this._value, changedProps);
+        }
+
+        update(value) {
+            this._value = value;
+            if (this._bindings) {
+                for (const binding of this._bindings) {
+                    binding();
                 }
             }
         }
@@ -5167,11 +6139,22 @@ var main = (function () {
             this._bindings.push(bindingFn);
         }
 
-        _addSubTemplate(t) {
-            if (!this._subTemplates) {
-                this._subTemplates = [];
+        _addSubView(view) {
+            if (!this._subViews) {
+                this._subViews = [];
             }
-            this._subTemplates.push(t);
+            this._subViews.push(view);
+        }
+    }
+
+    // what is passed to render
+    class TemplateBuilder {
+        constructor(templateView) {
+            this._templateView = templateView;
+        }
+
+        get _value() {
+            return this._templateView._value;
         }
 
         _addAttributeBinding(node, name, fn) {
@@ -5183,7 +6166,7 @@ var main = (function () {
                     setAttribute(node, name, newValue);
                 }
             };
-            this._addBinding(binding);
+            this._templateView._addBinding(binding);
             binding();
         }
 
@@ -5203,25 +6186,7 @@ var main = (function () {
                 }
             };
 
-            this._addBinding(binding);
-            return node;
-        }
-
-        el(name, attributes, children) {
-            if (attributes && isChildren(attributes)) {
-                children = attributes;
-                attributes = null;
-            }
-
-            const node = document.createElement(name);
-            
-            if (attributes) {
-                this._setNodeAttributes(node, attributes);
-            }
-            if (children) {
-                this._setNodeChildren(node, children);
-            }
-
+            this._templateView._addBinding(binding);
             return node;
         }
 
@@ -5238,7 +6203,7 @@ var main = (function () {
                 } else if (key.startsWith("on") && key.length > 2 && isFn) {
                     const eventName = key.substr(2, 1).toLowerCase() + key.substr(3);
                     const handler = value;
-                    this._addEventListener(node, eventName, handler);
+                    this._templateView._addEventListener(node, eventName, handler);
                 } else if (isFn) {
                     this._addAttributeBinding(node, key, value);
                 } else {
@@ -5277,71 +6242,85 @@ var main = (function () {
                     node = newNode;
                 }
             };
-            this._addBinding(binding);
+            this._templateView._addBinding(binding);
             return node;
         }
 
-        // creates a conditional subtemplate
-        if(fn, render) {
-            const boolFn = value => !!fn(value);
-            return this._addReplaceNodeBinding(boolFn, (prevNode) => {
+        el(name, attributes, children) {
+            return this.elNS(HTML_NS, name, attributes, children);
+        }
+
+        elNS(ns, name, attributes, children) {
+            if (attributes && isChildren(attributes)) {
+                children = attributes;
+                attributes = null;
+            }
+
+            const node = document.createElementNS(ns, name);
+            
+            if (attributes) {
+                this._setNodeAttributes(node, attributes);
+            }
+            if (children) {
+                this._setNodeChildren(node, children);
+            }
+
+            return node;
+        }
+
+        // this insert a view, and is not a view factory for `if`, so returns the root element to insert in the template
+        // you should not call t.view() and not use the result (e.g. attach the result to the template DOM tree).
+        view(view) {
+            let root;
+            try {
+                root = view.mount();
+            } catch (err) {
+                return errorToDOM(err);
+            }
+            this._templateView._addSubView(view);
+            return root;
+        }
+
+        // sugar
+        createTemplate(render) {
+            return vm => new TemplateView(vm, render);
+        }
+
+        // map a value to a view, every time the value changes
+        mapView(mapFn, viewCreator) {
+            return this._addReplaceNodeBinding(mapFn, (prevNode) => {
                 if (prevNode && prevNode.nodeType !== Node.COMMENT_NODE) {
-                    const templateIdx = this._subTemplates.findIndex(t => t.root() === prevNode);
-                    const [template] = this._subTemplates.splice(templateIdx, 1);
-                    template.dispose();
+                    const subViews = this._templateView._subViews;
+                    const viewIdx = subViews.findIndex(v => v.root() === prevNode);
+                    if (viewIdx !== -1) {
+                        const [view] = subViews.splice(viewIdx, 1);
+                        view.unmount();
+                    }
                 }
-                if (boolFn(this._value)) {
-                    const template = new Template(this._value, render);
-                    this._addSubTemplate(template);
-                    return template.root();
+                const view = viewCreator(mapFn(this._value));
+                if (view) {
+                    return this.view(view);
                 } else {
-                    return document.createComment("if placeholder");
+                    return document.createComment("node binding placeholder");
                 }
             });
         }
+
+        // creates a conditional subtemplate
+        if(fn, viewCreator) {
+            return this.mapView(
+                value => !!fn(value),
+                enabled => enabled ? viewCreator(this._value) : null
+            );
+        }
     }
 
-    for (const tag of TAG_NAMES) {
-        Template.prototype[tag] = function(attributes, children) {
-            return this.el(tag, attributes, children);
-        };
-    }
 
-    class TemplateView {
-        constructor(vm, bindToChangeEvent) {
-            this.viewModel = vm;
-            this._changeEventHandler = bindToChangeEvent ? this.update.bind(this, this.viewModel) : null;
-            this._template = null;
-        }
-
-        render() {
-            throw new Error("render not implemented");
-        }
-
-        mount() {
-            if (this._changeEventHandler) {
-                this.viewModel.on("change", this._changeEventHandler);
-            }
-            this._template = new Template(this.viewModel, (t, value) => this.render(t, value));
-            return this.root();
-        }
-
-        root() {
-            return this._template.root();
-        }
-
-        unmount() {
-            if (this._changeEventHandler) {
-                this.viewModel.off("change", this._changeEventHandler);
-            }
-            this._template.dispose();
-            this._template = null;
-        }
-
-        update(value, prop) {
-            if (this._template) {
-                this._template.update(value);
-            }
+    for (const [ns, tags] of Object.entries(TAG_NAMES)) {
+        for (const tag of tags) {
+            TemplateBuilder.prototype[tag] = function(attributes, children) {
+                return this.elNS(ns, tag, attributes, children);
+            };
         }
     }
 
@@ -5355,7 +6334,7 @@ var main = (function () {
 
         // called from ListView
         clicked() {
-            this.viewModel.open();
+            this.value.open();
         }
     }
 
@@ -5368,10 +6347,10 @@ var main = (function () {
             const label = (vm.isUp ? "🠝" : "🠟") + " fill gap"; //no binding
             return t.li({className}, [
                 t.button({
-                    onClick: () => this.viewModel.fill(),
+                    onClick: () => vm.fill(),
                     disabled: vm => vm.isLoading
                 }, label),
-                t.if(vm => vm.error, t => t.strong(vm => vm.error))
+                t.if(vm => vm.error, t.createTemplate(t => t.strong(vm => vm.error)))
             ]);
         }
     }
@@ -5483,7 +6462,7 @@ var main = (function () {
 
         _onKeyDown(event) {
             if (event.key === "Enter") {
-                if (this.viewModel.sendMessage(this._input.value)) {
+                if (this.value.sendMessage(this._input.value)) {
                     this._input.value = "";
                 }
             }
@@ -5492,11 +6471,12 @@ var main = (function () {
 
     class RoomView extends TemplateView {
         constructor(viewModel) {
-            super(viewModel, true);
+            super(viewModel);
             this._timelineList = null;
         }
 
         render(t, vm) {
+            this._timelineList = new TimelineList();
             return t.div({className: "RoomView"}, [
                 t.div({className: "TimelinePanel"}, [
                     t.div({className: "RoomHeader"}, [
@@ -5507,28 +6487,16 @@ var main = (function () {
                         ]),
                     ]),
                     t.div({className: "RoomView_error"}, vm => vm.error),
-                    this._timelineList.mount(),
-                    this._composer.mount(),
+                    t.view(this._timelineList),
+                    t.view(new MessageComposer(this.value.composerViewModel)),
                 ])
             ]);
-        }
-
-        mount() {
-            this._composer = new MessageComposer(this.viewModel);
-            this._timelineList = new TimelineList();
-            return super.mount();
-        }
-
-        unmount() {
-            this._composer.unmount();
-            this._timelineList.unmount();
-            super.unmount();
         }
 
         update(value, prop) {
             super.update(value, prop);
             if (prop === "timelineViewModel") {
-                this._timelineList.update({viewModel: this.viewModel.timelineViewModel});
+                this._timelineList.update({viewModel: this.value.timelineViewModel});
             }
         }
     }
@@ -5558,7 +6526,12 @@ var main = (function () {
             const oldRoot = this.root();
             this._childView.unmount();
             this._childView = newView;
-            const newRoot = this._childView.mount();
+            let newRoot;
+            try {
+                newRoot = this._childView.mount();
+            } catch (err) {
+                newRoot = errorToDOM(err);
+            }
             const parent = oldRoot.parentElement;
             if (parent) {
                 parent.replaceChild(newRoot, oldRoot);
@@ -5588,18 +6561,21 @@ var main = (function () {
         update() {}
     }
 
-    class SyncStatusBar extends TemplateView {
-        constructor(vm) {
-            super(vm, true);
-        }
+    function spinner(t, extraClasses = undefined) {
+        return t.svg({className: Object.assign({"spinner": true}, extraClasses), viewBox:"0 0 100 100"}, 
+            t.circle({cx:"50%", cy:"50%", r:"45%", pathLength:"100"})
+        );
+    }
 
+    class SessionStatusView extends TemplateView {
         render(t, vm) {
             return t.div({className: {
-                "SyncStatusBar": true,
-                "SyncStatusBar_shown": true,
+                "SessionStatusView": true,
+                "hidden": vm => !vm.isShown,
             }}, [
-                vm => vm.status,
-                t.if(vm => !vm.isSyncing, t => t.button({onClick: () => vm.trySync()}, "Try syncing")),
+                spinner(t, {hidden: vm => !vm.isWaiting}),
+                t.p(vm => vm.statusLabel),
+                t.if(vm => vm.isConnectNowShown, t.createTemplate(t => t.button({onClick: () => vm.connectNow()}, "Retry now"))),
                 window.DEBUG ? t.button({id: "showlogs"}, "Show logs") : ""
             ]);
         }
@@ -5621,7 +6597,7 @@ var main = (function () {
 
         mount() {
             this._viewModel.on("change", this._onViewModelChange);
-            this._syncStatusBar = new SyncStatusBar(this._viewModel.syncStatusViewModel);
+            this._sessionStatusBar = new SessionStatusView(this._viewModel.sessionStatusViewModel);
             this._roomList = new ListView(
                 {
                     className: "RoomList",
@@ -5633,7 +6609,7 @@ var main = (function () {
             this._middleSwitcher = new SwitchView(new RoomPlaceholderView());
 
             this._root = tag.div({className: "SessionView"}, [
-                this._syncStatusBar.mount(),
+                this._sessionStatusBar.mount(),
                 tag.div({className: "main"}, [
                     tag.div({className: "LeftPanel"}, this._roomList.mount()),
                     this._middleSwitcher.mount()
@@ -5673,26 +6649,33 @@ var main = (function () {
         }
     }
 
-    class LoginView extends TemplateView {
-        constructor(vm) {
-            super(vm, true);
+    class SessionLoadView extends TemplateView {
+        render(t) {
+            return t.div({className: "SessionLoadView"}, [
+                spinner(t, {hiddenWithLayout: vm => !vm.loading}),
+                t.p(vm => vm.loadLabel)
+            ]);
         }
+    }
 
+    class LoginView extends TemplateView {
         render(t, vm) {
-            const username = t.input({type: "text", placeholder: vm.usernamePlaceholder});
-            const password = t.input({type: "password", placeholder: vm.passwordPlaceholder});
-            const homeserver = t.input({type: "text", placeholder: vm.hsPlaceholder, value: vm.defaultHomeServer});
+            const disabled = vm => !!vm.isBusy;
+            const username = t.input({type: "text", placeholder: vm.i18n`Username`, disabled});
+            const password = t.input({type: "password", placeholder: vm.i18n`Password`, disabled});
+            const homeserver = t.input({type: "text", placeholder: vm.i18n`Your matrix homeserver`, value: vm.defaultHomeServer, disabled});
             return t.div({className: "LoginView form"}, [
-                t.h1(["Log in to your homeserver"]),
-                t.if(vm => vm.error, t => t.div({className: "error"}, vm => vm.error)),
+                t.h1([vm.i18n`Log in to your homeserver`]),
+                t.if(vm => vm.error, t.createTemplate(t => t.div({className: "error"}, vm => vm.error))),
                 t.div(username),
                 t.div(password),
                 t.div(homeserver),
                 t.div(t.button({
                     onClick: () => vm.login(username.value, password.value, homeserver.value),
-                    disabled: vm => vm.loading
-                }, "Log In")),
-                t.div(t.button({onClick: () => vm.cancel()}, ["Pick an existing session"])),
+                    disabled
+                }, vm.i18n`Log In`)),
+                t.div(t.button({onClick: () => vm.cancel(), disabled}, [vm.i18n`Pick an existing session`])),
+                t.mapView(vm => vm.loadViewModel, loadViewModel => loadViewModel ? new SessionLoadView(loadViewModel) : null),
                 t.p(brawlGithubLink(t))
             ]);
         }
@@ -5723,39 +6706,35 @@ var main = (function () {
 
 
     class SessionPickerItemView extends TemplateView {
-        constructor(vm) {
-            super(vm, true);
-        }
-
         _onDeleteClick() {
             if (confirm("Are you sure?")) {
-                this.viewModel.delete();
+                this.value.delete();
             }
         }
 
-        render(t) {
+        render(t, vm) {
             const deleteButton = t.button({
                 disabled: vm => vm.isDeleting,
                 onClick: this._onDeleteClick.bind(this),
             }, "Delete");
             const clearButton = t.button({
                 disabled: vm => vm.isClearing,
-                onClick: () => this.viewModel.clear(),
+                onClick: () => vm.clear(),
             }, "Clear");
             const exportButton = t.button({
                 disabled: vm => vm.isClearing,
-                onClick: () => this.viewModel.export(),
+                onClick: () => vm.export(),
             }, "Export");
-            const downloadExport = t.if(vm => vm.exportDataUrl, (t, vm) => {
+            const downloadExport = t.if(vm => vm.exportDataUrl, t.createTemplate((t, vm) => {
                 return t.a({
                     href: vm.exportDataUrl,
-                    download: `brawl-session-${this.viewModel.id}.json`,
-                    onClick: () => setTimeout(() => this.viewModel.clearExport(), 100),
+                    download: `brawl-session-${vm.id}.json`,
+                    onClick: () => setTimeout(() => vm.clearExport(), 100),
                 }, "Download");
-            });
+            }));
 
             const userName = t.span({className: "userId"}, vm => vm.label);
-            const errorMessage = t.if(vm => vm.error, t => t.span({className: "error"}, vm => vm.error));
+            const errorMessage = t.if(vm => vm.error, t.createTemplate(t => t.span({className: "error"}, vm => vm.error)));
             return t.li([t.div({className: "sessionInfo"}, [
                 userName,
                 errorMessage,
@@ -5768,33 +6747,26 @@ var main = (function () {
     }
 
     class SessionPickerView extends TemplateView {
-        mount() {
-            this._sessionList = new ListView({
-                list: this.viewModel.sessions,
+        render(t, vm) {
+            const sessionList = new ListView({
+                list: vm.sessions,
                 onItemClick: (item, event) => {
                     if (event.target.closest(".userId")) {
-                        this.viewModel.pick(item.viewModel.id);
+                        vm.pick(item.value.id);
                     }
                 },
             }, sessionInfo => {
                 return new SessionPickerItemView(sessionInfo);
             });
-            return super.mount();
-        }
 
-        render(t) {
             return t.div({className: "SessionPickerView"}, [
                 t.h1(["Pick a session"]),
-                this._sessionList.mount(),
-                t.p(t.button({onClick: () => this.viewModel.cancel()}, ["Log in to a new session instead"])),
-                t.p(t.button({onClick: async () => this.viewModel.import(await selectFileAsText("application/json"))}, "Import")),
+                t.view(sessionList),
+                t.p(t.button({onClick: () => vm.cancel()}, ["Log in to a new session instead"])),
+                t.p(t.button({onClick: async () => vm.import(await selectFileAsText("application/json"))}, "Import")),
+                t.if(vm => vm.loadViewModel, vm => new SessionLoadView(vm.loadViewModel)),
                 t.p(brawlGithubLink(t))
             ]);
-        }
-
-        unmount() {
-            super.unmount();
-            this._sessionList.unmount();
         }
     }
 
@@ -5810,8 +6782,6 @@ var main = (function () {
             switch (this._vm.activeSection) {
                 case "error":
                     return new StatusView({header: "Something went wrong", message: this._vm.errorText});
-                case "loading":
-                    return new StatusView({header: "Loading", message: this._vm.loadingText});
                 case "session":
                     return new SessionView(this._vm.sessionViewModel);
                 case "login":
@@ -5857,6 +6827,111 @@ var main = (function () {
         }
     }
 
+    class Timeout {
+        constructor(ms) {
+            this._reject = null;
+            this._handle = null;
+            this._promise = new Promise((resolve, reject) => {
+                this._reject = reject;
+                this._handle = setTimeout(() => {
+                    this._reject = null;
+                    resolve();
+                }, ms);
+            });
+        }
+
+        elapsed() {
+            return this._promise;
+        }
+
+        abort() {
+            if (this._reject) {
+                this._reject(new AbortError());
+                clearTimeout(this._handle);
+                this._handle = null;
+                this._reject = null;
+            }
+        }
+
+        dispose() {
+            this.abort();
+        }
+    }
+
+    class Interval {
+        constructor(ms, callback) {
+            this._handle = setInterval(callback, ms);
+        }
+
+        dispose() {
+            if (this._handle) {
+                clearInterval(this._handle);
+                this._handle = null;
+            }
+        }
+    }
+
+
+    class TimeMeasure {
+        constructor() {
+            this._start = window.performance.now();
+        }
+
+        measure() {
+            return window.performance.now() - this._start;
+        }
+    }
+
+    class Clock {
+        createMeasure() {
+            return new TimeMeasure();
+        }
+
+        createTimeout(ms) {
+            return new Timeout(ms);
+        }
+
+        createInterval(callback, ms) {
+            return new Interval(ms, callback);
+        }
+
+        now() {
+            return Date.now();
+        }
+    }
+
+    class OnlineStatus extends BaseObservableValue {
+        constructor() {
+            super();
+            this._onOffline = this._onOffline.bind(this);
+            this._onOnline = this._onOnline.bind(this);
+        }
+
+        _onOffline() {
+            this.emit(false);
+        }
+
+        _onOnline() {
+            this.emit(true);
+        }
+
+        get value() {
+            return navigator.onLine;
+        }
+
+        onSubscribeFirst() {
+            window.addEventListener('offline', this._onOffline);
+            window.addEventListener('online', this._onOnline);
+        }
+
+        onUnsubscribeLast() {
+            window.removeEventListener('offline', this._onOffline);
+            window.removeEventListener('online', this._onOnline);
+        }
+    }
+
+    // import {RecordRequester, ReplayRequester} from "./matrix/net/request/replay.js";
+
     async function main(container) {
         try {
             // to replay:
@@ -5868,15 +6943,28 @@ var main = (function () {
             // const recorder = new RecordRequester(fetchRequest);
             // const request = recorder.request;
             // window.getBrawlFetchLog = () => recorder.log();
-
             // normal network:
             const request = fetchRequest;
+            const sessionInfoStorage = new SessionInfoStorage("brawl_sessions_v1");
+            const clock = new Clock();
+            const storageFactory = new StorageFactory();
+
             const vm = new BrawlViewModel({
-                storageFactory: new StorageFactory(),
-                createHsApi: (homeServer, accessToken = null) => new HomeServerApi({homeServer, accessToken, request}),
-                sessionStore: new SessionsStore("brawl_sessions_v1"),
-                clock: Date //just for `now` fn
+                createSessionContainer: () => {
+                    return new SessionContainer({
+                        random: Math.random,
+                        onlineStatus: new OnlineStatus(),
+                        storageFactory,
+                        sessionInfoStorage,
+                        request,
+                        clock,
+                    });
+                },
+                sessionInfoStorage,
+                storageFactory,
+                clock,
             });
+            window.__brawlViewModel = vm;
             await vm.load();
             const view = new BrawlView(vm);
             container.appendChild(view.mount());
