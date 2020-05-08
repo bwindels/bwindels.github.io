@@ -5880,7 +5880,7 @@ var main = (function () {
     }
 
     class ListView {
-        constructor({list, onItemClick, className, parentProvidesUpdates}, childCreator) {
+        constructor({list, onItemClick, className, parentProvidesUpdates = true}, childCreator) {
             this._onItemClick = onItemClick;
             this._list = list;
             this._className = className;
