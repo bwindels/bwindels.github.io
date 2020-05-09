@@ -288,8 +288,8 @@ var main = (function () {
             );
         }
 
-        _request(method, url, queryParams, body, options) {
-            const queryString = Object.entries(queryParams || {})
+        _encodeQueryParams(queryParams) {
+            return Object.entries(queryParams || {})
                 .filter(([, value]) => value !== undefined)
                 .map(([name, value]) => {
                     if (typeof value === "object") {
@@ -298,6 +298,10 @@ var main = (function () {
                     return `${encodeURIComponent(name)}=${encodeURIComponent(value)}`;
                 })
                 .join("&");
+        }
+
+        _request(method, url, queryParams, body, options) {
+            const queryString = this._encodeQueryParams(queryParams);
             url = `${url}?${queryString}`;
             let bodyString;
             const headers = new Map();
@@ -380,6 +384,35 @@ var main = (function () {
 
         versions(options = null) {
             return this._request("GET", `${this._homeserver}/_matrix/client/versions`, null, null, options);
+        }
+
+        _parseMxcUrl(url) {
+            const prefix = "mxc://";
+            if (url.startsWith(prefix)) {
+                return url.substr(prefix.length).split("/", 2);
+            } else {
+                return null;
+            }
+        }
+
+        mxcUrlThumbnail(url, width, height, method) {
+            const parts = this._parseMxcUrl(url);
+            if (parts) {
+                const [serverName, mediaId] = parts;
+                const httpUrl = `${this._homeserver}/_matrix/media/r0/thumbnail/${encodeURIComponent(serverName)}/${encodeURIComponent(mediaId)}`;
+                return httpUrl + "?" + this._encodeQueryParams({width, height, method});
+            }
+            return null;
+        }
+
+        mxcUrl(url) {
+            const parts = this._parseMxcUrl(url);
+            if (parts) {
+                const [serverName, mediaId] = parts;
+                return `${this._homeserver}/_matrix/media/r0/download/${encodeURIComponent(serverName)}/${encodeURIComponent(mediaId)}`;
+            } else {
+                return null;
+            }
         }
     }
 
@@ -2773,6 +2806,14 @@ var main = (function () {
             await this._timeline.load();
             return this._timeline;
         }
+
+        mxcUrlThumbnail(url, width, height, method) {
+            return this._hsApi.mxcUrlThumbnail(url, width, height, method);
+        }
+
+        mxcUrl(url) {
+            return this._hsApi.mxcUrl(url);
+        }
     }
 
     class RateLimitingBackoff {
@@ -4773,6 +4814,53 @@ var main = (function () {
         }
     }
 
+    const MAX_HEIGHT = 300;
+    const MAX_WIDTH = 400;
+
+    class ImageTile extends MessageTile {
+        constructor(options, room) {
+            super(options);
+            this._room = room;
+        }
+
+        get thumbnailUrl() {
+            const mxcUrl = this._getContent().url;
+            return this._room.mxcUrlThumbnail(mxcUrl, this.thumbnailWidth, this.thumbnailHeigth, "scale");
+        }
+
+        get url() {
+            const mxcUrl = this._getContent().url;
+            return this._room.mxcUrl(mxcUrl);   
+        }
+
+        _scaleFactor() {
+            const {info} = this._getContent();
+            const scaleHeightFactor = MAX_HEIGHT / info.h;
+            const scaleWidthFactor = MAX_WIDTH / info.w;
+            // take the smallest scale factor, to respect all constraints
+            // we should not upscale images, so limit scale factor to 1 upwards
+            return Math.min(scaleWidthFactor, scaleHeightFactor, 1);
+        }
+
+        get thumbnailWidth() {
+            const {info} = this._getContent();
+            return Math.round(info.w * this._scaleFactor());
+        }
+
+        get thumbnailHeigth() {
+            const {info} = this._getContent();
+            return Math.round(info.h * this._scaleFactor());
+        }
+
+        get label() {
+            return this._getContent().body;
+        }
+
+        get shape() {
+            return "image";
+        }
+    }
+
     /*
     map urls:
     apple:   https://developer.apple.com/library/archive/featuredarticles/iPhoneURLScheme_Reference/MapLinks/MapLinks.html
@@ -4862,8 +4950,7 @@ var main = (function () {
                             case "m.emote":
                                 return new TextTile(options);
                             case "m.image":
-                                return null; // not supported yet
-                                // return new ImageTile(options);
+                                return new ImageTile(options, room);
                             case "m.location":
                                 return new LocationTile(options);
                             default:
@@ -6367,6 +6454,20 @@ var main = (function () {
         }
     }
 
+    class ImageView extends TemplateView {
+        render(t, vm) {
+            return t.li(
+                {className: {"TextMessageView": true, own: vm.isOwn, pending: vm.isPending}},
+                t.div({className: "message-container"}, [
+                    t.div({className: "sender"}, vm => vm.isContinuation ? "" : vm.sender),
+                    t.div(t.a({href: vm.url, target: "_blank"},
+                        t.img({src: vm.thumbnailUrl, width: vm.thumbnailWidth, heigth: vm.thumbnailHeigth, loading: "lazy", alt: vm.label}))),
+                    t.p(t.time(vm.date + " " + vm.time)),
+                ])
+            );
+        }
+    }
+
     class AnnouncementView extends TemplateView {
         render(t) {
             return t.li({className: "AnnouncementView"}, t.div(vm => vm.announcement));
@@ -6380,7 +6481,8 @@ var main = (function () {
                 switch (entry.shape) {
                     case "gap": return new GapView(entry);
                     case "announcement": return new AnnouncementView(entry);
-                    case "message":return new TextMessageView(entry);
+                    case "message": return new TextMessageView(entry);
+                    case "image": return new ImageView(entry);
                 }
             });
             this._atBottom = false;
