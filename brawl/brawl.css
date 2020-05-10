@@ -65,6 +65,7 @@ body {
     background: #333;
     color: white;
     overflow-y: auto;
+    overscroll-behavior: contain;
 }
 .LeftPanel ul {
     list-style: none;
@@ -166,6 +167,7 @@ body {
 }
 .TimelinePanel ul {
     overflow-y: auto;
+    overscroll-behavior: contain;
     list-style: none;
     padding: 0;
     margin: 0;
@@ -189,6 +191,7 @@ body {
 }
 .message-container img {
     max-width: 100%;
+    height: 100%;
     display: block;
 }
 .TextMessageView {
@@ -298,6 +301,8 @@ body {
                 "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
     background-color: black;
     color: white;
+    /* make sure to disable rubber-banding and pull to refresh in a PWA if we'd end up having a scrollbar */
+    overscroll-behavior: none;
 }
 .hiddenWithLayout {
     visibility: hidden;
