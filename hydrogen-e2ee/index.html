@@ -1,0 +1,26 @@
+<!DOCTYPE html><html manifest="manifest.appcache"><head>
+		<meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, user-scalable=no">
+        <meta name="application-name" content="Hydrogen Chat">
+        <meta name="apple-mobile-web-app-capable" content="yes">
+        <meta name="apple-mobile-web-app-status-bar-style" content="black">
+        <meta name="apple-mobile-web-app-title" content="Hydrogen Chat">
+        <meta name="description" content="A matrix chat application">
+        <link rel="stylesheet" type="text/css" href="hydrogen-2287382861.css">
+        <link rel="stylesheet" type="text/css" href="themes/element/bundle-4290731165.css" title="Element Theme">
+        <link rel="alternate stylesheet" type="text/css" href="themes/bubbles/bundle-2682099160.css" title="Bubbles Theme">
+	<link rel="manifest" href="manifest-2714077836.json"></head>
+	<body class="hydrogen">
+        <script id="version" type="text/javascript">
+            window.HYDROGEN_VERSION = "0.0.34";
+        </script>
+		<script type="module">import {main} from "./hydrogen-852099961.js"; main(document.body, {"wasm":"olm-4289088762.wasm","legacyBundle":"olm_legacy-3232457086.js","wasmBundle":"olm-1421970081.js"});</script><script type="text/javascript" nomodule src="hydrogen-legacy-3610260442.js"></script><script type="text/javascript" nomodule>hydrogenBundle.main(document.body, {"wasm":"olm-4289088762.wasm","legacyBundle":"olm_legacy-3232457086.js","wasmBundle":"olm-1421970081.js"});</script>
+        <script id="service-worker" type="text/javascript">
+            if('serviceWorker' in navigator) {
+                navigator.serviceWorker.register('sw.js')
+                    .then(function() { console.log("Service Worker registered"); });
+            }
+        </script>
+	
+
+</body></html>
