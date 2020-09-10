@@ -8789,30 +8789,6 @@ var hydrogenBundle = (function (exports) {
 
 	var INCREMENTAL_TIMEOUT = 30000;
 	var SyncStatus = createEnum("InitialSync", "CatchupSync", "Syncing", "Stopped");
-	function parseRooms(roomsSection, roomCallback) {
-	  if (roomsSection) {
-	    var allMemberships = ["join", "invite", "leave"];
-	    var _loop = function _loop() {
-	      var membership = _allMemberships[_i];
-	      var membershipSection = roomsSection[membership];
-	      if (membershipSection) {
-	        return {
-	          v: Object.entries(membershipSection).map(function (_ref) {
-	            var _ref2 = _slicedToArray(_ref, 2),
-	                roomId = _ref2[0],
-	                roomResponse = _ref2[1];
-	            return roomCallback(roomId, roomResponse, membership);
-	          })
-	        };
-	      }
-	    };
-	    for (var _i = 0, _allMemberships = allMemberships; _i < _allMemberships.length; _i++) {
-	      var _ret = _loop();
-	      if (_typeof(_ret) === "object") return _ret.v;
-	    }
-	  }
-	  return [];
-	}
 	function timelineIsEmpty(roomResponse) {
 	  try {
 	    var _roomResponse$timelin;
@@ -8823,10 +8799,10 @@ var hydrogenBundle = (function (exports) {
 	  }
 	}
 	var Sync = function () {
-	  function Sync(_ref3) {
-	    var hsApi = _ref3.hsApi,
-	        session = _ref3.session,
-	        storage = _ref3.storage;
+	  function Sync(_ref) {
+	    var hsApi = _ref.hsApi,
+	        session = _ref.session,
+	        storage = _ref.storage;
 	    _classCallCheck(this, Sync);
 	    this._hsApi = hsApi;
 	    this._session = session;
@@ -8853,7 +8829,7 @@ var hydrogenBundle = (function (exports) {
 	    key: "_syncLoop",
 	    value: function () {
 	      var _syncLoop2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee(syncToken) {
-	        var afterSyncCompletedPromise, roomChanges, timeout, syncResult;
+	        var afterSyncCompletedPromise, roomStates, timeout, syncResult;
 	        return regeneratorRuntime.wrap(function _callee$(_context) {
 	          while (1) {
 	            switch (_context.prev = _context.next) {
@@ -8864,7 +8840,7 @@ var hydrogenBundle = (function (exports) {
 	                  _context.next = 20;
 	                  break;
 	                }
-	                roomChanges = void 0;
+	                roomStates = void 0;
 	                _context.prev = 3;
 	                console.log("starting sync request with since ".concat(syncToken, " ..."));
 	                timeout = syncToken ? INCREMENTAL_TIMEOUT : undefined;
@@ -8873,7 +8849,7 @@ var hydrogenBundle = (function (exports) {
 	              case 8:
 	                syncResult = _context.sent;
 	                syncToken = syncResult.syncToken;
-	                roomChanges = syncResult.roomChanges;
+	                roomStates = syncResult.roomStates;
 	                this._status.set(SyncStatus.Syncing);
 	                _context.next = 17;
 	                break;
@@ -8886,7 +8862,7 @@ var hydrogenBundle = (function (exports) {
 	                }
 	              case 17:
 	                if (!this._error) {
-	                  afterSyncCompletedPromise = this._runAfterSyncCompleted(roomChanges);
+	                  afterSyncCompletedPromise = this._runAfterSyncCompleted(roomStates);
 	                }
 	                _context.next = 1;
 	                break;
@@ -8905,9 +8881,9 @@ var hydrogenBundle = (function (exports) {
 	  }, {
 	    key: "_runAfterSyncCompleted",
 	    value: function () {
-	      var _runAfterSyncCompleted2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee4(roomChanges) {
+	      var _runAfterSyncCompleted2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee4(roomStates) {
 	        var _this = this;
-	        var sessionPromise, allPromises, roomsNeedingAfterSyncCompleted;
+	        var sessionPromise, roomsNeedingAfterSyncCompleted, roomsPromises;
 	        return regeneratorRuntime.wrap(function _callee4$(_context4) {
 	          while (1) {
 	            switch (_context4.prev = _context4.next) {
@@ -8934,44 +8910,39 @@ var hydrogenBundle = (function (exports) {
 	                    }
 	                  }, _callee2, null, [[0, 5]]);
 	                }))();
-	                allPromises = [sessionPromise];
-	                roomsNeedingAfterSyncCompleted = roomChanges.filter(function (rc) {
-	                  return rc.changes.needsAfterSyncCompleted;
+	                roomsNeedingAfterSyncCompleted = roomStates.filter(function (rs) {
+	                  return rs.room.needsAfterSyncCompleted(rs.changes);
 	                });
-	                if (roomsNeedingAfterSyncCompleted.length) {
-	                  allPromises = allPromises.concat(roomsNeedingAfterSyncCompleted.map( function () {
-	                    var _ref6 = _asyncToGenerator( regeneratorRuntime.mark(function _callee3(_ref5) {
-	                      var room, changes;
-	                      return regeneratorRuntime.wrap(function _callee3$(_context3) {
-	                        while (1) {
-	                          switch (_context3.prev = _context3.next) {
-	                            case 0:
-	                              room = _ref5.room, changes = _ref5.changes;
-	                              _context3.prev = 1;
-	                              _context3.next = 4;
-	                              return room.afterSyncCompleted(changes);
-	                            case 4:
-	                              _context3.next = 9;
-	                              break;
-	                            case 6:
-	                              _context3.prev = 6;
-	                              _context3.t0 = _context3["catch"](1);
-	                              console.error("error during room ".concat(room.id, " afterSyncCompleted, continuing"), _context3.t0.stack);
-	                            case 9:
-	                            case "end":
-	                              return _context3.stop();
-	                          }
+	                roomsPromises = roomsNeedingAfterSyncCompleted.map( function () {
+	                  var _ref3 = _asyncToGenerator( regeneratorRuntime.mark(function _callee3(rs) {
+	                    return regeneratorRuntime.wrap(function _callee3$(_context3) {
+	                      while (1) {
+	                        switch (_context3.prev = _context3.next) {
+	                          case 0:
+	                            _context3.prev = 0;
+	                            _context3.next = 3;
+	                            return rs.room.afterSyncCompleted(rs.changes);
+	                          case 3:
+	                            _context3.next = 8;
+	                            break;
+	                          case 5:
+	                            _context3.prev = 5;
+	                            _context3.t0 = _context3["catch"](0);
+	                            console.error("error during room ".concat(rs.room.id, " afterSyncCompleted, continuing"), _context3.t0.stack);
+	                          case 8:
+	                          case "end":
+	                            return _context3.stop();
 	                        }
-	                      }, _callee3, null, [[1, 6]]);
-	                    }));
-	                    return function (_x3) {
-	                      return _ref6.apply(this, arguments);
-	                    };
-	                  }()));
-	                }
-	                _context4.next = 6;
-	                return Promise.all(allPromises);
-	              case 6:
+	                      }
+	                    }, _callee3, null, [[0, 5]]);
+	                  }));
+	                  return function (_x3) {
+	                    return _ref3.apply(this, arguments);
+	                  };
+	                }());
+	                _context4.next = 5;
+	                return Promise.all(roomsPromises.concat(sessionPromise));
+	              case 5:
 	              case "end":
 	                return _context4.stop();
 	            }
@@ -8986,15 +8957,15 @@ var hydrogenBundle = (function (exports) {
 	  }, {
 	    key: "_syncRequest",
 	    value: function () {
-	      var _syncRequest2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee5(syncToken, timeout, prevAfterSyncCompletedPromise) {
-	        var syncFilterId, totalRequestTimeout, response, isInitialSync, syncTxn, roomChanges, sessionChanges, _iterator, _step, _step$value, room, changes;
-	        return regeneratorRuntime.wrap(function _callee5$(_context5) {
+	      var _syncRequest2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee6(syncToken, timeout, prevAfterSyncCompletedPromise) {
+	        var syncFilterId, totalRequestTimeout, response, isInitialSync, roomStates, sessionChanges, syncTxn, _iterator, _step, rs;
+	        return regeneratorRuntime.wrap(function _callee6$(_context6) {
 	          while (1) {
-	            switch (_context5.prev = _context5.next) {
+	            switch (_context6.prev = _context6.next) {
 	              case 0:
 	                syncFilterId = this._session.syncFilterId;
 	                if (!(typeof syncFilterId !== "string")) {
-	                  _context5.next = 6;
+	                  _context6.next = 6;
 	                  break;
 	                }
 	                this._currentRequest = this._hsApi.createFilter(this._session.user.id, {
@@ -9004,88 +8975,106 @@ var hydrogenBundle = (function (exports) {
 	                    }
 	                  }
 	                });
-	                _context5.next = 5;
+	                _context6.next = 5;
 	                return this._currentRequest.response();
 	              case 5:
-	                syncFilterId = _context5.sent.filter_id;
+	                syncFilterId = _context6.sent.filter_id;
 	              case 6:
 	                totalRequestTimeout = timeout + 80 * 1000;
 	                this._currentRequest = this._hsApi.sync(syncToken, syncFilterId, timeout, {
 	                  timeout: totalRequestTimeout
 	                });
-	                _context5.next = 10;
+	                _context6.next = 10;
 	                return this._currentRequest.response();
 	              case 10:
-	                response = _context5.sent;
-	                _context5.next = 13;
+	                response = _context6.sent;
+	                _context6.next = 13;
 	                return prevAfterSyncCompletedPromise;
 	              case 13:
 	                isInitialSync = !syncToken;
 	                syncToken = response.next_batch;
-	                _context5.next = 17;
+	                roomStates = this._parseRoomsResponse(response.rooms, isInitialSync);
+	                _context6.next = 18;
+	                return this._prepareRooms(roomStates);
+	              case 18:
+	                _context6.next = 20;
 	                return this._openSyncTxn();
-	              case 17:
-	                syncTxn = _context5.sent;
-	                roomChanges = [];
-	                _context5.prev = 19;
-	                if (!response.rooms) {
-	                  _context5.next = 24;
-	                  break;
-	                }
-	                _context5.next = 23;
-	                return this._writeRoomResponses(response.rooms, isInitialSync, syncTxn);
-	              case 23:
-	                roomChanges = _context5.sent;
+	              case 20:
+	                syncTxn = _context6.sent;
+	                _context6.prev = 21;
+	                _context6.next = 24;
+	                return Promise.all(roomStates.map( function () {
+	                  var _ref4 = _asyncToGenerator( regeneratorRuntime.mark(function _callee5(rs) {
+	                    return regeneratorRuntime.wrap(function _callee5$(_context5) {
+	                      while (1) {
+	                        switch (_context5.prev = _context5.next) {
+	                          case 0:
+	                            console.log(" * applying sync response to room ".concat(rs.room.id, " ..."));
+	                            _context5.next = 3;
+	                            return rs.room.writeSync(rs.roomResponse, rs.membership, isInitialSync, rs.preparation, syncTxn);
+	                          case 3:
+	                            rs.changes = _context5.sent;
+	                          case 4:
+	                          case "end":
+	                            return _context5.stop();
+	                        }
+	                      }
+	                    }, _callee5);
+	                  }));
+	                  return function (_x7) {
+	                    return _ref4.apply(this, arguments);
+	                  };
+	                }()));
 	              case 24:
-	                _context5.next = 26;
-	                return this._session.writeSync(response, syncFilterId, roomChanges, syncTxn);
+	                _context6.next = 26;
+	                return this._session.writeSync(response, syncFilterId, syncTxn);
 	              case 26:
-	                sessionChanges = _context5.sent;
-	                _context5.next = 35;
+	                sessionChanges = _context6.sent;
+	                _context6.next = 35;
 	                break;
 	              case 29:
-	                _context5.prev = 29;
-	                _context5.t0 = _context5["catch"](19);
+	                _context6.prev = 29;
+	                _context6.t0 = _context6["catch"](21);
 	                console.warn("aborting syncTxn because of error");
-	                console.error(_context5.t0);
+	                console.error(_context6.t0);
 	                syncTxn.abort();
-	                throw _context5.t0;
+	                throw _context6.t0;
 	              case 35:
-	                _context5.prev = 35;
-	                _context5.next = 38;
+	                _context6.prev = 35;
+	                _context6.next = 38;
 	                return syncTxn.complete();
 	              case 38:
 	                console.info("syncTxn committed!!");
-	                _context5.next = 45;
+	                _context6.next = 45;
 	                break;
 	              case 41:
-	                _context5.prev = 41;
-	                _context5.t1 = _context5["catch"](35);
+	                _context6.prev = 41;
+	                _context6.t1 = _context6["catch"](35);
 	                console.error("unable to commit sync tranaction");
-	                throw _context5.t1;
+	                throw _context6.t1;
 	              case 45:
 	                this._session.afterSync(sessionChanges);
-	                _iterator = _createForOfIteratorHelper(roomChanges);
+	                _iterator = _createForOfIteratorHelper(roomStates);
 	                try {
 	                  for (_iterator.s(); !(_step = _iterator.n()).done;) {
-	                    _step$value = _step.value, room = _step$value.room, changes = _step$value.changes;
-	                    room.afterSync(changes);
+	                    rs = _step.value;
+	                    rs.room.afterSync(rs.changes);
 	                  }
 	                } catch (err) {
 	                  _iterator.e(err);
 	                } finally {
 	                  _iterator.f();
 	                }
-	                return _context5.abrupt("return", {
+	                return _context6.abrupt("return", {
 	                  syncToken: syncToken,
-	                  roomChanges: roomChanges
+	                  roomStates: roomStates
 	                });
 	              case 49:
 	              case "end":
-	                return _context5.stop();
+	                return _context6.stop();
 	            }
 	          }
-	        }, _callee5, this, [[19, 29], [35, 41]]);
+	        }, _callee6, this, [[21, 29], [35, 41]]);
 	      }));
 	      function _syncRequest(_x4, _x5, _x6) {
 	        return _syncRequest2.apply(this, arguments);
@@ -9093,96 +9082,163 @@ var hydrogenBundle = (function (exports) {
 	      return _syncRequest;
 	    }()
 	  }, {
-	    key: "_writeRoomResponses",
+	    key: "_openPrepareSyncTxn",
 	    value: function () {
-	      var _writeRoomResponses2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee7(roomResponses, isInitialSync, syncTxn) {
-	        var _this2 = this;
-	        var roomChanges, promises;
+	      var _openPrepareSyncTxn2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee7() {
+	        var storeNames;
 	        return regeneratorRuntime.wrap(function _callee7$(_context7) {
 	          while (1) {
 	            switch (_context7.prev = _context7.next) {
 	              case 0:
-	                roomChanges = [];
-	                promises = parseRooms(roomResponses, function () {
-	                  var _ref7 = _asyncToGenerator( regeneratorRuntime.mark(function _callee6(roomId, roomResponse, membership) {
-	                    var room, changes;
-	                    return regeneratorRuntime.wrap(function _callee6$(_context6) {
-	                      while (1) {
-	                        switch (_context6.prev = _context6.next) {
-	                          case 0:
-	                            if (!(isInitialSync && timelineIsEmpty(roomResponse))) {
-	                              _context6.next = 2;
-	                              break;
-	                            }
-	                            return _context6.abrupt("return");
-	                          case 2:
-	                            room = _this2._session.rooms.get(roomId);
-	                            if (!room) {
-	                              room = _this2._session.createRoom(roomId);
-	                            }
-	                            console.log(" * applying sync response to room ".concat(roomId, " ..."));
-	                            _context6.next = 7;
-	                            return room.writeSync(roomResponse, membership, isInitialSync, syncTxn);
-	                          case 7:
-	                            changes = _context6.sent;
-	                            roomChanges.push({
-	                              room: room,
-	                              changes: changes
-	                            });
-	                          case 9:
-	                          case "end":
-	                            return _context6.stop();
-	                        }
-	                      }
-	                    }, _callee6);
-	                  }));
-	                  return function (_x10, _x11, _x12) {
-	                    return _ref7.apply(this, arguments);
-	                  };
-	                }());
-	                _context7.next = 4;
-	                return Promise.all(promises);
+	                storeNames = this._storage.storeNames;
+	                _context7.next = 3;
+	                return this._storage.readTxn([storeNames.inboundGroupSessions]);
+	              case 3:
+	                return _context7.abrupt("return", _context7.sent);
 	              case 4:
-	                return _context7.abrupt("return", roomChanges);
-	              case 5:
 	              case "end":
 	                return _context7.stop();
 	            }
 	          }
-	        }, _callee7);
+	        }, _callee7, this);
 	      }));
-	      function _writeRoomResponses(_x7, _x8, _x9) {
-	        return _writeRoomResponses2.apply(this, arguments);
+	      function _openPrepareSyncTxn() {
+	        return _openPrepareSyncTxn2.apply(this, arguments);
 	      }
-	      return _writeRoomResponses;
+	      return _openPrepareSyncTxn;
+	    }()
+	  }, {
+	    key: "_prepareRooms",
+	    value: function () {
+	      var _prepareRooms2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee10(roomStates) {
+	        var prepareRoomStates, prepareTxn;
+	        return regeneratorRuntime.wrap(function _callee10$(_context10) {
+	          while (1) {
+	            switch (_context10.prev = _context10.next) {
+	              case 0:
+	                prepareRoomStates = roomStates.filter(function (rs) {
+	                  return rs.room.needsPrepareSync;
+	                });
+	                if (!prepareRoomStates.length) {
+	                  _context10.next = 9;
+	                  break;
+	                }
+	                _context10.next = 4;
+	                return this._openPrepareSyncTxn();
+	              case 4:
+	                prepareTxn = _context10.sent;
+	                _context10.next = 7;
+	                return Promise.all(prepareRoomStates.map( function () {
+	                  var _ref5 = _asyncToGenerator( regeneratorRuntime.mark(function _callee8(rs) {
+	                    return regeneratorRuntime.wrap(function _callee8$(_context8) {
+	                      while (1) {
+	                        switch (_context8.prev = _context8.next) {
+	                          case 0:
+	                            _context8.next = 2;
+	                            return rs.room.prepareSync(rs.roomResponse, prepareTxn);
+	                          case 2:
+	                            rs.preparation = _context8.sent;
+	                          case 3:
+	                          case "end":
+	                            return _context8.stop();
+	                        }
+	                      }
+	                    }, _callee8);
+	                  }));
+	                  return function (_x9) {
+	                    return _ref5.apply(this, arguments);
+	                  };
+	                }()));
+	              case 7:
+	                _context10.next = 9;
+	                return Promise.all(prepareRoomStates.map( function () {
+	                  var _ref6 = _asyncToGenerator( regeneratorRuntime.mark(function _callee9(rs) {
+	                    return regeneratorRuntime.wrap(function _callee9$(_context9) {
+	                      while (1) {
+	                        switch (_context9.prev = _context9.next) {
+	                          case 0:
+	                            _context9.next = 2;
+	                            return rs.room.afterPrepareSync(rs.preparation);
+	                          case 2:
+	                            rs.preparation = _context9.sent;
+	                          case 3:
+	                          case "end":
+	                            return _context9.stop();
+	                        }
+	                      }
+	                    }, _callee9);
+	                  }));
+	                  return function (_x10) {
+	                    return _ref6.apply(this, arguments);
+	                  };
+	                }()));
+	              case 9:
+	              case "end":
+	                return _context10.stop();
+	            }
+	          }
+	        }, _callee10, this);
+	      }));
+	      function _prepareRooms(_x8) {
+	        return _prepareRooms2.apply(this, arguments);
+	      }
+	      return _prepareRooms;
 	    }()
 	  }, {
 	    key: "_openSyncTxn",
 	    value: function () {
-	      var _openSyncTxn2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee8() {
+	      var _openSyncTxn2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee11() {
 	        var storeNames;
-	        return regeneratorRuntime.wrap(function _callee8$(_context8) {
+	        return regeneratorRuntime.wrap(function _callee11$(_context11) {
 	          while (1) {
-	            switch (_context8.prev = _context8.next) {
+	            switch (_context11.prev = _context11.next) {
 	              case 0:
 	                storeNames = this._storage.storeNames;
-	                _context8.next = 3;
-	                return this._storage.readWriteTxn([storeNames.session, storeNames.roomSummary, storeNames.roomState, storeNames.roomMembers, storeNames.timelineEvents, storeNames.timelineFragments, storeNames.pendingEvents, storeNames.userIdentities, storeNames.inboundGroupSessions, storeNames.groupSessionDecryptions, storeNames.deviceIdentities,
+	                _context11.next = 3;
+	                return this._storage.readWriteTxn([storeNames.session, storeNames.roomSummary, storeNames.roomState, storeNames.roomMembers, storeNames.timelineEvents, storeNames.timelineFragments, storeNames.pendingEvents, storeNames.userIdentities, storeNames.groupSessionDecryptions, storeNames.deviceIdentities,
 	                storeNames.outboundGroupSessions]);
 	              case 3:
-	                return _context8.abrupt("return", _context8.sent);
+	                return _context11.abrupt("return", _context11.sent);
 	              case 4:
 	              case "end":
-	                return _context8.stop();
+	                return _context11.stop();
 	            }
 	          }
-	        }, _callee8, this);
+	        }, _callee11, this);
 	      }));
 	      function _openSyncTxn() {
 	        return _openSyncTxn2.apply(this, arguments);
 	      }
 	      return _openSyncTxn;
 	    }()
+	  }, {
+	    key: "_parseRoomsResponse",
+	    value: function _parseRoomsResponse(roomsSection, isInitialSync) {
+	      var roomStates = [];
+	      if (roomsSection) {
+	        var allMemberships = ["join"];
+	        for (var _i = 0, _allMemberships = allMemberships; _i < _allMemberships.length; _i++) {
+	          var membership = _allMemberships[_i];
+	          var membershipSection = roomsSection[membership];
+	          if (membershipSection) {
+	            for (var _i2 = 0, _Object$entries = Object.entries(membershipSection); _i2 < _Object$entries.length; _i2++) {
+	              var _Object$entries$_i = _slicedToArray(_Object$entries[_i2], 2),
+	                  roomId = _Object$entries$_i[0],
+	                  roomResponse = _Object$entries$_i[1];
+	              if (isInitialSync && timelineIsEmpty(roomResponse)) {
+	                return;
+	              }
+	              var room = this._session.rooms.get(roomId);
+	              if (!room) {
+	                room = this._session.createRoom(roomId);
+	              }
+	              roomStates.push(new RoomSyncProcessState(room, roomResponse, membership));
+	            }
+	          }
+	        }
+	      }
+	      return roomStates;
+	    }
 	  }, {
 	    key: "stop",
 	    value: function stop() {
@@ -9208,6 +9264,14 @@ var hydrogenBundle = (function (exports) {
 	  }]);
 	  return Sync;
 	}();
+	var RoomSyncProcessState = function RoomSyncProcessState(room, roomResponse, membership) {
+	  _classCallCheck(this, RoomSyncProcessState);
+	  this.room = room;
+	  this.roomResponse = roomResponse;
+	  this.membership = membership;
+	  this.preparation = null;
+	  this.changes = null;
+	};
 
 	var EventEmitter = function () {
 	  function EventEmitter() {
@@ -9350,6 +9414,7 @@ var hydrogenBundle = (function (exports) {
 	  stringify: stringify
 	};
 
+	var DecryptionSource = createEnum(["Sync", "Timeline", "Retry"]);
 	var SESSION_KEY_PREFIX = "e2ee:";
 	var OLM_ALGORITHM = "m.olm.v1.curve25519-aes-sha2";
 	var MEGOLM_ALGORITHM = "m.megolm.v1.aes-sha2";
@@ -10548,7 +10613,7 @@ var hydrogenBundle = (function (exports) {
 	            switch (_context9.prev = _context9.next) {
 	              case 0:
 	                memberChanges = new Map();
-	                if (!timeline.events) {
+	                if (!Array.isArray(timeline.events)) {
 	                  _context9.next = 28;
 	                  break;
 	                }
@@ -12142,6 +12207,94 @@ var hydrogenBundle = (function (exports) {
 	  }
 	});
 
+	function disposeValue(value) {
+	  if (typeof value === "function") {
+	    value();
+	  } else {
+	    value.dispose();
+	  }
+	}
+	var Disposables = function () {
+	  function Disposables() {
+	    _classCallCheck(this, Disposables);
+	    this._disposables = [];
+	  }
+	  _createClass(Disposables, [{
+	    key: "track",
+	    value: function track(disposable) {
+	      if (this.isDisposed) {
+	        throw new Error("Already disposed, check isDisposed after await if needed");
+	      }
+	      this._disposables.push(disposable);
+	      return disposable;
+	    }
+	  }, {
+	    key: "dispose",
+	    value: function dispose() {
+	      if (this._disposables) {
+	        var _iterator = _createForOfIteratorHelper(this._disposables),
+	            _step;
+	        try {
+	          for (_iterator.s(); !(_step = _iterator.n()).done;) {
+	            var d = _step.value;
+	            disposeValue(d);
+	          }
+	        } catch (err) {
+	          _iterator.e(err);
+	        } finally {
+	          _iterator.f();
+	        }
+	        this._disposables = null;
+	      }
+	    }
+	  }, {
+	    key: "disposeTracked",
+	    value: function disposeTracked(value) {
+	      if (value === undefined || value === null || this.isDisposed) {
+	        return null;
+	      }
+	      var idx = this._disposables.indexOf(value);
+	      if (idx !== -1) {
+	        var _this$_disposables$sp = this._disposables.splice(idx, 1),
+	            _this$_disposables$sp2 = _slicedToArray(_this$_disposables$sp, 1),
+	            foundValue = _this$_disposables$sp2[0];
+	        disposeValue(foundValue);
+	      } else {
+	        console.warn("disposable not found, did it leak?", value);
+	      }
+	      return null;
+	    }
+	  }, {
+	    key: "isDisposed",
+	    get: function get() {
+	      return this._disposables === null;
+	    }
+	  }]);
+	  return Disposables;
+	}();
+
+	var ReaderRequest = function () {
+	  function ReaderRequest(fn) {
+	    _classCallCheck(this, ReaderRequest);
+	    this.decryptRequest = null;
+	    this._promise = fn(this);
+	  }
+	  _createClass(ReaderRequest, [{
+	    key: "complete",
+	    value: function complete() {
+	      return this._promise;
+	    }
+	  }, {
+	    key: "dispose",
+	    value: function dispose() {
+	      if (this.decryptRequest) {
+	        this.decryptRequest.dispose();
+	        this.decryptRequest = null;
+	      }
+	    }
+	  }]);
+	  return ReaderRequest;
+	}();
 	var TimelineReader = function () {
 	  function TimelineReader(_ref) {
 	    var roomId = _ref.roomId,
@@ -12161,203 +12314,186 @@ var hydrogenBundle = (function (exports) {
 	  }, {
 	    key: "_openTxn",
 	    value: function _openTxn() {
+	      var stores = [this._storage.storeNames.timelineEvents, this._storage.storeNames.timelineFragments];
 	      if (this._decryptEntries) {
-	        return this._storage.readWriteTxn([this._storage.storeNames.timelineEvents, this._storage.storeNames.timelineFragments, this._storage.storeNames.inboundGroupSessions, this._storage.storeNames.groupSessionDecryptions, this._storage.storeNames.deviceIdentities]);
-	      } else {
-	        return this._storage.readTxn([this._storage.storeNames.timelineEvents, this._storage.storeNames.timelineFragments]);
+	        stores.push(this._storage.storeNames.inboundGroupSessions);
 	      }
+	      return this._storage.readTxn(stores);
 	    }
 	  }, {
 	    key: "readFrom",
-	    value: function () {
-	      var _readFrom2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee(eventKey, direction, amount) {
-	        var txn, entries;
-	        return regeneratorRuntime.wrap(function _callee$(_context) {
-	          while (1) {
-	            switch (_context.prev = _context.next) {
-	              case 0:
-	                _context.next = 2;
-	                return this._openTxn();
-	              case 2:
-	                txn = _context.sent;
-	                _context.prev = 3;
-	                _context.next = 6;
-	                return this._readFrom(eventKey, direction, amount, txn);
-	              case 6:
-	                entries = _context.sent;
-	                _context.next = 13;
-	                break;
-	              case 9:
-	                _context.prev = 9;
-	                _context.t0 = _context["catch"](3);
-	                txn.abort();
-	                throw _context.t0;
-	              case 13:
-	                _context.next = 15;
-	                return txn.complete();
-	              case 15:
-	                return _context.abrupt("return", entries);
-	              case 16:
-	              case "end":
-	                return _context.stop();
+	    value: function readFrom(eventKey, direction, amount) {
+	      var _this = this;
+	      return new ReaderRequest( function () {
+	        var _ref2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee(r) {
+	          var txn;
+	          return regeneratorRuntime.wrap(function _callee$(_context) {
+	            while (1) {
+	              switch (_context.prev = _context.next) {
+	                case 0:
+	                  _context.next = 2;
+	                  return _this._openTxn();
+	                case 2:
+	                  txn = _context.sent;
+	                  _context.next = 5;
+	                  return _this._readFrom(eventKey, direction, amount, r, txn);
+	                case 5:
+	                  return _context.abrupt("return", _context.sent);
+	                case 6:
+	                case "end":
+	                  return _context.stop();
+	              }
 	            }
-	          }
-	        }, _callee, this, [[3, 9]]);
-	      }));
-	      function readFrom(_x, _x2, _x3) {
-	        return _readFrom2.apply(this, arguments);
-	      }
-	      return readFrom;
-	    }()
+	          }, _callee);
+	        }));
+	        return function (_x) {
+	          return _ref2.apply(this, arguments);
+	        };
+	      }());
+	    }
+	  }, {
+	    key: "readFromEnd",
+	    value: function readFromEnd(amount) {
+	      var _this2 = this;
+	      return new ReaderRequest( function () {
+	        var _ref3 = _asyncToGenerator( regeneratorRuntime.mark(function _callee2(r) {
+	          var txn, liveFragment, entries, liveFragmentEntry, eventKey;
+	          return regeneratorRuntime.wrap(function _callee2$(_context2) {
+	            while (1) {
+	              switch (_context2.prev = _context2.next) {
+	                case 0:
+	                  _context2.next = 2;
+	                  return _this2._openTxn();
+	                case 2:
+	                  txn = _context2.sent;
+	                  _context2.next = 5;
+	                  return txn.timelineFragments.liveFragment(_this2._roomId);
+	                case 5:
+	                  liveFragment = _context2.sent;
+	                  if (liveFragment) {
+	                    _context2.next = 10;
+	                    break;
+	                  }
+	                  entries = [];
+	                  _context2.next = 17;
+	                  break;
+	                case 10:
+	                  _this2._fragmentIdComparer.add(liveFragment);
+	                  liveFragmentEntry = FragmentBoundaryEntry.end(liveFragment, _this2._fragmentIdComparer);
+	                  eventKey = liveFragmentEntry.asEventKey();
+	                  _context2.next = 15;
+	                  return _this2._readFrom(eventKey, Direction.Backward, amount, r, txn);
+	                case 15:
+	                  entries = _context2.sent;
+	                  entries.unshift(liveFragmentEntry);
+	                case 17:
+	                  return _context2.abrupt("return", entries);
+	                case 18:
+	                case "end":
+	                  return _context2.stop();
+	              }
+	            }
+	          }, _callee2);
+	        }));
+	        return function (_x2) {
+	          return _ref3.apply(this, arguments);
+	        };
+	      }());
+	    }
 	  }, {
 	    key: "_readFrom",
 	    value: function () {
-	      var _readFrom3 = _asyncToGenerator( regeneratorRuntime.mark(function _callee2(eventKey, direction, amount, txn) {
-	        var _this = this;
+	      var _readFrom2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee3(eventKey, direction, amount, r, txn) {
+	        var _this3 = this;
 	        var entries, timelineStore, fragmentStore, eventsWithinFragment, eventEntries, fragment, fragmentEntry, nextFragment, nextFragmentEntry;
-	        return regeneratorRuntime.wrap(function _callee2$(_context2) {
+	        return regeneratorRuntime.wrap(function _callee3$(_context3) {
 	          while (1) {
-	            switch (_context2.prev = _context2.next) {
+	            switch (_context3.prev = _context3.next) {
 	              case 0:
 	                entries = [];
 	                timelineStore = txn.timelineEvents;
 	                fragmentStore = txn.timelineFragments;
 	              case 3:
 	                if (!(entries.length < amount && eventKey)) {
-	                  _context2.next = 39;
+	                  _context3.next = 35;
 	                  break;
 	                }
 	                eventsWithinFragment = void 0;
 	                if (!direction.isForward) {
-	                  _context2.next = 11;
+	                  _context3.next = 11;
 	                  break;
 	                }
-	                _context2.next = 8;
+	                _context3.next = 8;
 	                return timelineStore.eventsAfter(this._roomId, eventKey, amount);
 	              case 8:
-	                eventsWithinFragment = _context2.sent;
-	                _context2.next = 14;
+	                eventsWithinFragment = _context3.sent;
+	                _context3.next = 14;
 	                break;
 	              case 11:
-	                _context2.next = 13;
+	                _context3.next = 13;
 	                return timelineStore.eventsBefore(this._roomId, eventKey, amount);
 	              case 13:
-	                eventsWithinFragment = _context2.sent;
+	                eventsWithinFragment = _context3.sent;
 	              case 14:
 	                eventEntries = eventsWithinFragment.map(function (e) {
-	                  return new EventEntry(e, _this._fragmentIdComparer);
+	                  return new EventEntry(e, _this3._fragmentIdComparer);
 	                });
-	                if (!this._decryptEntries) {
-	                  _context2.next = 19;
-	                  break;
-	                }
-	                _context2.next = 18;
-	                return this._decryptEntries(eventEntries, txn);
-	              case 18:
-	                eventEntries = _context2.sent;
-	              case 19:
 	                entries = directionalConcat(entries, eventEntries, direction);
 	                if (!(entries.length < amount)) {
-	                  _context2.next = 37;
+	                  _context3.next = 33;
 	                  break;
 	                }
-	                _context2.next = 23;
+	                _context3.next = 19;
 	                return fragmentStore.get(this._roomId, eventKey.fragmentId);
-	              case 23:
-	                fragment = _context2.sent;
+	              case 19:
+	                fragment = _context3.sent;
 	                fragmentEntry = new FragmentBoundaryEntry(fragment, direction.isBackward, this._fragmentIdComparer);
 	                directionalAppend(entries, fragmentEntry, direction);
 	                if (!(!fragmentEntry.token && fragmentEntry.hasLinkedFragment)) {
-	                  _context2.next = 36;
+	                  _context3.next = 32;
 	                  break;
 	                }
-	                _context2.next = 29;
+	                _context3.next = 25;
 	                return fragmentStore.get(this._roomId, fragmentEntry.linkedFragmentId);
-	              case 29:
-	                nextFragment = _context2.sent;
+	              case 25:
+	                nextFragment = _context3.sent;
 	                this._fragmentIdComparer.add(nextFragment);
 	                nextFragmentEntry = new FragmentBoundaryEntry(nextFragment, direction.isForward, this._fragmentIdComparer);
 	                directionalAppend(entries, nextFragmentEntry, direction);
 	                eventKey = nextFragmentEntry.asEventKey();
-	                _context2.next = 37;
+	                _context3.next = 33;
 	                break;
-	              case 36:
+	              case 32:
 	                eventKey = null;
-	              case 37:
-	                _context2.next = 3;
+	              case 33:
+	                _context3.next = 3;
 	                break;
-	              case 39:
-	                return _context2.abrupt("return", entries);
-	              case 40:
-	              case "end":
-	                return _context2.stop();
-	            }
-	          }
-	        }, _callee2, this);
-	      }));
-	      function _readFrom(_x4, _x5, _x6, _x7) {
-	        return _readFrom3.apply(this, arguments);
-	      }
-	      return _readFrom;
-	    }()
-	  }, {
-	    key: "readFromEnd",
-	    value: function () {
-	      var _readFromEnd = _asyncToGenerator( regeneratorRuntime.mark(function _callee3(amount) {
-	        var txn, entries, liveFragment, liveFragmentEntry, eventKey;
-	        return regeneratorRuntime.wrap(function _callee3$(_context3) {
-	          while (1) {
-	            switch (_context3.prev = _context3.next) {
-	              case 0:
-	                _context3.next = 2;
-	                return this._openTxn();
-	              case 2:
-	                txn = _context3.sent;
-	                _context3.prev = 3;
-	                _context3.next = 6;
-	                return txn.timelineFragments.liveFragment(this._roomId);
-	              case 6:
-	                liveFragment = _context3.sent;
-	                if (liveFragment) {
-	                  _context3.next = 11;
+	              case 35:
+	                if (!this._decryptEntries) {
+	                  _context3.next = 43;
 	                  break;
 	                }
-	                entries = [];
-	                _context3.next = 18;
-	                break;
-	              case 11:
-	                this._fragmentIdComparer.add(liveFragment);
-	                liveFragmentEntry = FragmentBoundaryEntry.end(liveFragment, this._fragmentIdComparer);
-	                eventKey = liveFragmentEntry.asEventKey();
-	                _context3.next = 16;
-	                return this._readFrom(eventKey, Direction.Backward, amount, txn);
-	              case 16:
-	                entries = _context3.sent;
-	                entries.unshift(liveFragmentEntry);
-	              case 18:
-	                _context3.next = 24;
-	                break;
-	              case 20:
-	                _context3.prev = 20;
-	                _context3.t0 = _context3["catch"](3);
-	                txn.abort();
-	                throw _context3.t0;
-	              case 24:
-	                _context3.next = 26;
-	                return txn.complete();
-	              case 26:
+	                r.decryptRequest = this._decryptEntries(entries, txn);
+	                _context3.prev = 37;
+	                _context3.next = 40;
+	                return r.decryptRequest.complete();
+	              case 40:
+	                _context3.prev = 40;
+	                r.decryptRequest = null;
+	                return _context3.finish(40);
+	              case 43:
 	                return _context3.abrupt("return", entries);
-	              case 27:
+	              case 44:
 	              case "end":
 	                return _context3.stop();
 	            }
 	          }
-	        }, _callee3, this, [[3, 20]]);
+	        }, _callee3, this, [[37,, 40, 43]]);
 	      }));
-	      function readFromEnd(_x8) {
-	        return _readFromEnd.apply(this, arguments);
+	      function _readFrom(_x3, _x4, _x5, _x6, _x7) {
+	        return _readFrom2.apply(this, arguments);
 	      }
-	      return readFromEnd;
+	      return _readFrom;
 	    }()
 	  }]);
 	  return TimelineReader;
@@ -12446,6 +12582,7 @@ var hydrogenBundle = (function (exports) {
 	    this._storage = storage;
 	    this._closeCallback = closeCallback;
 	    this._fragmentIdComparer = fragmentIdComparer;
+	    this._disposables = new Disposables();
 	    this._remoteEntries = new SortedArray(function (a, b) {
 	      return a.compare(b);
 	    });
@@ -12454,6 +12591,7 @@ var hydrogenBundle = (function (exports) {
 	      storage: this._storage,
 	      fragmentIdComparer: this._fragmentIdComparer
 	    });
+	    this._readerRequest = null;
 	    var localEntries = new MappedList(pendingEvents, function (pe) {
 	      return new PendingEventEntry({
 	        pendingEvent: pe,
@@ -12468,41 +12606,34 @@ var hydrogenBundle = (function (exports) {
 	    key: "load",
 	    value: function () {
 	      var _load = _asyncToGenerator( regeneratorRuntime.mark(function _callee() {
-	        var entries;
+	        var readerRequest, entries;
 	        return regeneratorRuntime.wrap(function _callee$(_context) {
 	          while (1) {
 	            switch (_context.prev = _context.next) {
 	              case 0:
-	                _context.next = 2;
-	                return this._timelineReader.readFromEnd(50);
-	              case 2:
+	                readerRequest = this._disposables.track(this._timelineReader.readFromEnd(30));
+	                _context.prev = 1;
+	                _context.next = 4;
+	                return readerRequest.complete();
+	              case 4:
 	                entries = _context.sent;
 	                this._remoteEntries.setManySorted(entries);
-	              case 4:
+	              case 6:
+	                _context.prev = 6;
+	                this._disposables.disposeTracked(readerRequest);
+	                return _context.finish(6);
+	              case 9:
 	              case "end":
 	                return _context.stop();
 	            }
 	          }
-	        }, _callee, this);
+	        }, _callee, this, [[1,, 6, 9]]);
 	      }));
 	      function load() {
 	        return _load.apply(this, arguments);
 	      }
 	      return load;
 	    }()
-	  }, {
-	    key: "findEntry",
-	    value: function findEntry(eventKey) {
-	      var entry = new EventEntry(eventKey, this._fragmentIdComparer);
-	      try {
-	        var idx = this._remoteEntries.indexOf(entry);
-	        if (idx !== -1) {
-	          return this._remoteEntries.get(idx);
-	        }
-	      } catch (err) {
-	        return;
-	      }
-	    }
 	  }, {
 	    key: "replaceEntries",
 	    value: function replaceEntries(entries) {
@@ -12533,7 +12664,7 @@ var hydrogenBundle = (function (exports) {
 	    key: "loadAtTop",
 	    value: function () {
 	      var _loadAtTop = _asyncToGenerator( regeneratorRuntime.mark(function _callee2(amount) {
-	        var firstEventEntry, entries;
+	        var firstEventEntry, readerRequest, entries;
 	        return regeneratorRuntime.wrap(function _callee2$(_context2) {
 	          while (1) {
 	            switch (_context2.prev = _context2.next) {
@@ -12547,17 +12678,23 @@ var hydrogenBundle = (function (exports) {
 	                }
 	                return _context2.abrupt("return");
 	              case 3:
-	                _context2.next = 5;
-	                return this._timelineReader.readFrom(firstEventEntry.asEventKey(), Direction.Backward, amount);
-	              case 5:
+	                readerRequest = this._disposables.track(this._timelineReader.readFrom(firstEventEntry.asEventKey(), Direction.Backward, amount));
+	                _context2.prev = 4;
+	                _context2.next = 7;
+	                return readerRequest.complete();
+	              case 7:
 	                entries = _context2.sent;
 	                this._remoteEntries.setManySorted(entries);
-	              case 7:
+	              case 9:
+	                _context2.prev = 9;
+	                this._disposables.disposeTracked(readerRequest);
+	                return _context2.finish(9);
+	              case 12:
 	              case "end":
 	                return _context2.stop();
 	            }
 	          }
-	        }, _callee2, this);
+	        }, _callee2, this, [[4,, 9, 12]]);
 	      }));
 	      function loadAtTop(_x) {
 	        return _loadAtTop.apply(this, arguments);
@@ -12565,9 +12702,10 @@ var hydrogenBundle = (function (exports) {
 	      return loadAtTop;
 	    }()
 	  }, {
-	    key: "close",
-	    value: function close() {
+	    key: "dispose",
+	    value: function dispose() {
 	      if (this._closeCallback) {
+	        this._disposables.dispose();
 	        this._closeCallback();
 	        this._closeCallback = null;
 	      }
@@ -13608,6 +13746,7 @@ var hydrogenBundle = (function (exports) {
 	  return Heroes;
 	}();
 
+	var EVENT_ENCRYPTED_TYPE = "m.room.encrypted";
 	var Room = function (_EventEmitter) {
 	  _inherits(Room, _EventEmitter);
 	  var _super = _createSuper(Room);
@@ -13653,93 +13792,69 @@ var hydrogenBundle = (function (exports) {
 	    key: "notifyRoomKeys",
 	    value: function () {
 	      var _notifyRoomKeys = _asyncToGenerator( regeneratorRuntime.mark(function _callee(roomKeys) {
-	        var retryEntries, decryptedEntries, txn, _iterator, _step, _this$_timeline, retryEntry, eventKey, entry, storageEntry;
+	        var retryEventIds, retryEntries, txn, _iterator, _step, eventId, storageEntry, decryptRequest;
 	        return regeneratorRuntime.wrap(function _callee$(_context) {
 	          while (1) {
 	            switch (_context.prev = _context.next) {
 	              case 0:
 	                if (!this._roomEncryption) {
-	                  _context.next = 44;
+	                  _context.next = 30;
 	                  break;
 	                }
-	                retryEntries = this._roomEncryption.applyRoomKeys(roomKeys);
-	                decryptedEntries = [];
-	                if (!retryEntries.length) {
-	                  _context.next = 43;
+	                retryEventIds = this._roomEncryption.applyRoomKeys(roomKeys);
+	                if (!retryEventIds.length) {
+	                  _context.next = 30;
 	                  break;
 	                }
+	                retryEntries = [];
 	                _context.next = 6;
-	                return this._storage.readWriteTxn([this._storage.storeNames.timelineEvents, this._storage.storeNames.inboundGroupSessions, this._storage.storeNames.groupSessionDecryptions, this._storage.storeNames.deviceIdentities]);
+	                return this._storage.readTxn([this._storage.storeNames.timelineEvents, this._storage.storeNames.inboundGroupSessions]);
 	              case 6:
 	                txn = _context.sent;
-	                _context.prev = 7;
-	                _iterator = _createForOfIteratorHelper(retryEntries);
-	                _context.prev = 9;
+	                _iterator = _createForOfIteratorHelper(retryEventIds);
+	                _context.prev = 8;
 	                _iterator.s();
-	              case 11:
+	              case 10:
 	                if ((_step = _iterator.n()).done) {
-	                  _context.next = 27;
+	                  _context.next = 18;
 	                  break;
 	                }
-	                retryEntry = _step.value;
-	                eventKey = retryEntry.data;
-	                entry = (_this$_timeline = this._timeline) === null || _this$_timeline === void 0 ? void 0 : _this$_timeline.findEntry(eventKey);
-	                if (entry) {
-	                  _context.next = 20;
-	                  break;
-	                }
-	                _context.next = 18;
-	                return txn.timelineEvents.get(this._roomId, eventKey);
-	              case 18:
+	                eventId = _step.value;
+	                _context.next = 14;
+	                return txn.timelineEvents.getByEventId(this._roomId, eventId);
+	              case 14:
 	                storageEntry = _context.sent;
 	                if (storageEntry) {
-	                  entry = new EventEntry(storageEntry, this._fragmentIdComparer);
+	                  retryEntries.push(new EventEntry(storageEntry, this._fragmentIdComparer));
 	                }
-	              case 20:
-	                if (!entry) {
-	                  _context.next = 25;
-	                  break;
-	                }
+	              case 16:
+	                _context.next = 10;
+	                break;
+	              case 18:
 	                _context.next = 23;
-	                return this._decryptEntry(entry, txn, retryEntry.isSync);
-	              case 23:
-	                entry = _context.sent;
-	                decryptedEntries.push(entry);
-	              case 25:
-	                _context.next = 11;
 	                break;
-	              case 27:
-	                _context.next = 32;
-	                break;
-	              case 29:
-	                _context.prev = 29;
-	                _context.t0 = _context["catch"](9);
+	              case 20:
+	                _context.prev = 20;
+	                _context.t0 = _context["catch"](8);
 	                _iterator.e(_context.t0);
-	              case 32:
-	                _context.prev = 32;
+	              case 23:
+	                _context.prev = 23;
 	                _iterator.f();
-	                return _context.finish(32);
-	              case 35:
-	                _context.next = 41;
-	                break;
-	              case 37:
-	                _context.prev = 37;
-	                _context.t1 = _context["catch"](7);
-	                txn.abort();
-	                throw _context.t1;
-	              case 41:
-	                _context.next = 43;
-	                return txn.complete();
-	              case 43:
+	                return _context.finish(23);
+	              case 26:
+	                decryptRequest = this._decryptEntries(DecryptionSource.Retry, retryEntries, txn);
+	                _context.next = 29;
+	                return decryptRequest.complete();
+	              case 29:
 	                if (this._timeline) {
-	                  this._timeline.replaceEntries(decryptedEntries);
+	                  this._timeline.replaceEntries(retryEntries);
 	                }
-	              case 44:
+	              case 30:
 	              case "end":
 	                return _context.stop();
 	            }
 	          }
-	        }, _callee, this, [[7, 37], [9, 29, 32, 35]]);
+	        }, _callee, this, [[8, 20, 23, 26]]);
 	      }));
 	      function notifyRoomKeys(_x) {
 	        return _notifyRoomKeys.apply(this, arguments);
@@ -13753,145 +13868,218 @@ var hydrogenBundle = (function (exports) {
 	      if (this._roomEncryption) {
 	        this._sendQueue.enableEncryption(this._roomEncryption);
 	        if (this._timeline) {
-	          this._timeline.enableEncryption(this._decryptEntries.bind(this));
+	          this._timeline.enableEncryption(this._decryptEntries.bind(this, DecryptionSource.Timeline));
 	        }
 	      }
 	    }
 	  }, {
-	    key: "_decryptEntry",
+	    key: "_decryptEntries",
+	    value: function _decryptEntries(source, entries) {
+	      var _this2 = this;
+	      var inboundSessionTxn = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : null;
+	      var request = new DecryptionRequest( function () {
+	        var _ref2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee2(r) {
+	          var events, isTimelineOpen, changes, stores, writeTxn, decryption;
+	          return regeneratorRuntime.wrap(function _callee2$(_context2) {
+	            while (1) {
+	              switch (_context2.prev = _context2.next) {
+	                case 0:
+	                  if (inboundSessionTxn) {
+	                    _context2.next = 4;
+	                    break;
+	                  }
+	                  _context2.next = 3;
+	                  return _this2._storage.readTxn([_this2._storage.storeNames.inboundGroupSessions]);
+	                case 3:
+	                  inboundSessionTxn = _context2.sent;
+	                case 4:
+	                  if (!r.cancelled) {
+	                    _context2.next = 6;
+	                    break;
+	                  }
+	                  return _context2.abrupt("return");
+	                case 6:
+	                  events = entries.filter(function (entry) {
+	                    return entry.eventType === EVENT_ENCRYPTED_TYPE;
+	                  }).map(function (entry) {
+	                    return entry.event;
+	                  });
+	                  isTimelineOpen = _this2._isTimelineOpen;
+	                  _context2.next = 10;
+	                  return _this2._roomEncryption.prepareDecryptAll(events, source, isTimelineOpen, inboundSessionTxn);
+	                case 10:
+	                  r.preparation = _context2.sent;
+	                  if (!r.cancelled) {
+	                    _context2.next = 13;
+	                    break;
+	                  }
+	                  return _context2.abrupt("return");
+	                case 13:
+	                  _context2.next = 15;
+	                  return r.preparation.decrypt();
+	                case 15:
+	                  changes = _context2.sent;
+	                  r.preparation = null;
+	                  if (!r.cancelled) {
+	                    _context2.next = 19;
+	                    break;
+	                  }
+	                  return _context2.abrupt("return");
+	                case 19:
+	                  stores = [_this2._storage.storeNames.groupSessionDecryptions];
+	                  if (isTimelineOpen) {
+	                    stores.push(_this2._storage.storeNames.deviceIdentities);
+	                  }
+	                  _context2.next = 23;
+	                  return _this2._storage.readWriteTxn(stores);
+	                case 23:
+	                  writeTxn = _context2.sent;
+	                  _context2.prev = 24;
+	                  _context2.next = 27;
+	                  return changes.write(writeTxn);
+	                case 27:
+	                  decryption = _context2.sent;
+	                  _context2.next = 34;
+	                  break;
+	                case 30:
+	                  _context2.prev = 30;
+	                  _context2.t0 = _context2["catch"](24);
+	                  writeTxn.abort();
+	                  throw _context2.t0;
+	                case 34:
+	                  _context2.next = 36;
+	                  return writeTxn.complete();
+	                case 36:
+	                  decryption.applyToEntries(entries);
+	                case 37:
+	                case "end":
+	                  return _context2.stop();
+	              }
+	            }
+	          }, _callee2, null, [[24, 30]]);
+	        }));
+	        return function (_x2) {
+	          return _ref2.apply(this, arguments);
+	        };
+	      }());
+	      return request;
+	    }
+	  }, {
+	    key: "prepareSync",
 	    value: function () {
-	      var _decryptEntry2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee2(entry, txn, isSync) {
-	        var decryptionResult;
-	        return regeneratorRuntime.wrap(function _callee2$(_context2) {
+	      var _prepareSync = _asyncToGenerator( regeneratorRuntime.mark(function _callee3(roomResponse, txn) {
+	        var _roomResponse$timelin, events, eventsToDecrypt, preparation;
+	        return regeneratorRuntime.wrap(function _callee3$(_context3) {
 	          while (1) {
-	            switch (_context2.prev = _context2.next) {
+	            switch (_context3.prev = _context3.next) {
 	              case 0:
-	                if (!(entry.eventType === "m.room.encrypted")) {
-	                  _context2.next = 12;
+	                if (!this._roomEncryption) {
+	                  _context3.next = 8;
 	                  break;
 	                }
-	                _context2.prev = 1;
-	                _context2.next = 4;
-	                return this._roomEncryption.decrypt(entry.event, isSync, !!this._timeline, entry.asEventKey(), txn);
-	              case 4:
-	                decryptionResult = _context2.sent;
-	                if (decryptionResult) {
-	                  entry.setDecryptionResult(decryptionResult);
+	                events = roomResponse === null || roomResponse === void 0 ? void 0 : (_roomResponse$timelin = roomResponse.timeline) === null || _roomResponse$timelin === void 0 ? void 0 : _roomResponse$timelin.events;
+	                if (!Array.isArray(events)) {
+	                  _context3.next = 8;
+	                  break;
 	                }
-	                _context2.next = 12;
-	                break;
+	                eventsToDecrypt = events.filter(function (event) {
+	                  return (event === null || event === void 0 ? void 0 : event.type) === EVENT_ENCRYPTED_TYPE;
+	                });
+	                _context3.next = 6;
+	                return this._roomEncryption.prepareDecryptAll(eventsToDecrypt, DecryptionSource.Sync, this._isTimelineOpen, txn);
+	              case 6:
+	                preparation = _context3.sent;
+	                return _context3.abrupt("return", preparation);
 	              case 8:
-	                _context2.prev = 8;
-	                _context2.t0 = _context2["catch"](1);
-	                console.warn("event decryption error", _context2.t0, entry.event);
-	                entry.setDecryptionError(_context2.t0);
-	              case 12:
-	                return _context2.abrupt("return", entry);
-	              case 13:
 	              case "end":
-	                return _context2.stop();
+	                return _context3.stop();
 	            }
 	          }
-	        }, _callee2, this, [[1, 8]]);
+	        }, _callee3, this);
 	      }));
-	      function _decryptEntry(_x2, _x3, _x4) {
-	        return _decryptEntry2.apply(this, arguments);
+	      function prepareSync(_x3, _x4) {
+	        return _prepareSync.apply(this, arguments);
 	      }
-	      return _decryptEntry;
+	      return prepareSync;
 	    }()
 	  }, {
-	    key: "_decryptEntries",
+	    key: "afterPrepareSync",
 	    value: function () {
-	      var _decryptEntries2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee4(entries, txn) {
-	        var _this2 = this;
-	        var isSync,
-	            _args4 = arguments;
+	      var _afterPrepareSync = _asyncToGenerator( regeneratorRuntime.mark(function _callee4(preparation) {
+	        var decryptChanges;
 	        return regeneratorRuntime.wrap(function _callee4$(_context4) {
 	          while (1) {
 	            switch (_context4.prev = _context4.next) {
 	              case 0:
-	                isSync = _args4.length > 2 && _args4[2] !== undefined ? _args4[2] : false;
+	                if (!preparation) {
+	                  _context4.next = 5;
+	                  break;
+	                }
 	                _context4.next = 3;
-	                return Promise.all(entries.map( function () {
-	                  var _ref2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee3(e) {
-	                    return regeneratorRuntime.wrap(function _callee3$(_context3) {
-	                      while (1) {
-	                        switch (_context3.prev = _context3.next) {
-	                          case 0:
-	                            return _context3.abrupt("return", _this2._decryptEntry(e, txn, isSync));
-	                          case 1:
-	                          case "end":
-	                            return _context3.stop();
-	                        }
-	                      }
-	                    }, _callee3);
-	                  }));
-	                  return function (_x7) {
-	                    return _ref2.apply(this, arguments);
-	                  };
-	                }()));
+	                return preparation.decrypt();
 	              case 3:
-	                return _context4.abrupt("return", _context4.sent);
-	              case 4:
+	                decryptChanges = _context4.sent;
+	                return _context4.abrupt("return", decryptChanges);
+	              case 5:
 	              case "end":
 	                return _context4.stop();
 	            }
 	          }
 	        }, _callee4);
 	      }));
-	      function _decryptEntries(_x5, _x6) {
-	        return _decryptEntries2.apply(this, arguments);
+	      function afterPrepareSync(_x5) {
+	        return _afterPrepareSync.apply(this, arguments);
 	      }
-	      return _decryptEntries;
+	      return afterPrepareSync;
 	    }()
 	  }, {
 	    key: "writeSync",
 	    value: function () {
-	      var _writeSync = _asyncToGenerator( regeneratorRuntime.mark(function _callee5(roomResponse, membership, isInitialSync, txn) {
-	        var _this$_roomEncryption;
-	        var isTimelineOpen, summaryChanges, _yield$this$_syncWrit, encryptedEntries, newLiveKey, memberChanges, entries, heroChanges, removedPendingEvents;
+	      var _writeSync = _asyncToGenerator( regeneratorRuntime.mark(function _callee5(roomResponse, membership, isInitialSync, decryptChanges, txn) {
+	        var decryption, _yield$this$_syncWrit, entries, newLiveKey, memberChanges, summaryChanges, heroChanges, removedPendingEvents;
 	        return regeneratorRuntime.wrap(function _callee5$(_context5) {
 	          while (1) {
 	            switch (_context5.prev = _context5.next) {
 	              case 0:
-	                isTimelineOpen = !!this._timeline;
-	                summaryChanges = this._summary.writeSync(roomResponse, membership, isInitialSync, isTimelineOpen, txn);
-	                _context5.next = 4;
-	                return this._syncWriter.writeSync(roomResponse, this.isTrackingMembers, txn);
-	              case 4:
-	                _yield$this$_syncWrit = _context5.sent;
-	                encryptedEntries = _yield$this$_syncWrit.entries;
-	                newLiveKey = _yield$this$_syncWrit.newLiveKey;
-	                memberChanges = _yield$this$_syncWrit.memberChanges;
-	                entries = encryptedEntries;
-	                if (!this._roomEncryption) {
-	                  _context5.next = 13;
+	                if (!(this._roomEncryption && decryptChanges)) {
+	                  _context5.next = 4;
 	                  break;
 	                }
-	                _context5.next = 12;
-	                return this._decryptEntries(encryptedEntries, txn, true);
-	              case 12:
-	                entries = _context5.sent;
-	              case 13:
+	                _context5.next = 3;
+	                return decryptChanges.write(txn);
+	              case 3:
+	                decryption = _context5.sent;
+	              case 4:
+	                _context5.next = 6;
+	                return this._syncWriter.writeSync(roomResponse, this.isTrackingMembers, txn);
+	              case 6:
+	                _yield$this$_syncWrit = _context5.sent;
+	                entries = _yield$this$_syncWrit.entries;
+	                newLiveKey = _yield$this$_syncWrit.newLiveKey;
+	                memberChanges = _yield$this$_syncWrit.memberChanges;
+	                if (decryption) {
+	                  decryption.applyToEntries(entries);
+	                }
+	                if (!(this._roomEncryption && this.isTrackingMembers && (memberChanges === null || memberChanges === void 0 ? void 0 : memberChanges.size))) {
+	                  _context5.next = 14;
+	                  break;
+	                }
+	                _context5.next = 14;
+	                return this._roomEncryption.writeMemberChanges(memberChanges, txn);
+	              case 14:
+	                summaryChanges = this._summary.writeSync(roomResponse, membership, isInitialSync, this._isTimelineOpen, txn);
 	                if (!needsHeroes(summaryChanges)) {
-	                  _context5.next = 18;
+	                  _context5.next = 20;
 	                  break;
 	                }
 	                if (!this._heroes) {
 	                  this._heroes = new Heroes(this._roomId);
 	                }
-	                _context5.next = 17;
+	                _context5.next = 19;
 	                return this._heroes.calculateChanges(summaryChanges.heroes, memberChanges, txn);
-	              case 17:
+	              case 19:
 	                heroChanges = _context5.sent;
-	              case 18:
-	                if (!(this._roomEncryption && this.isTrackingMembers && (memberChanges === null || memberChanges === void 0 ? void 0 : memberChanges.size))) {
-	                  _context5.next = 21;
-	                  break;
-	                }
-	                _context5.next = 21;
-	                return this._roomEncryption.writeMemberChanges(memberChanges, txn);
-	              case 21:
+	              case 20:
 	                if (roomResponse.timeline && roomResponse.timeline.events) {
 	                  removedPendingEvents = this._sendQueue.removeRemoteEchos(roomResponse.timeline.events, txn);
 	                }
@@ -13901,17 +14089,16 @@ var hydrogenBundle = (function (exports) {
 	                  newLiveKey: newLiveKey,
 	                  removedPendingEvents: removedPendingEvents,
 	                  memberChanges: memberChanges,
-	                  heroChanges: heroChanges,
-	                  needsAfterSyncCompleted: (_this$_roomEncryption = this._roomEncryption) === null || _this$_roomEncryption === void 0 ? void 0 : _this$_roomEncryption.needsToShareKeys(memberChanges)
+	                  heroChanges: heroChanges
 	                });
-	              case 23:
+	              case 22:
 	              case "end":
 	                return _context5.stop();
 	            }
 	          }
 	        }, _callee5, this);
 	      }));
-	      function writeSync(_x8, _x9, _x10, _x11) {
+	      function writeSync(_x6, _x7, _x8, _x9, _x10) {
 	        return _writeSync.apply(this, arguments);
 	      }
 	      return writeSync;
@@ -13977,15 +14164,22 @@ var hydrogenBundle = (function (exports) {
 	      }
 	    }
 	  }, {
+	    key: "needsAfterSyncCompleted",
+	    value: function needsAfterSyncCompleted(_ref4) {
+	      var _this$_roomEncryption;
+	      var memberChanges = _ref4.memberChanges;
+	      return (_this$_roomEncryption = this._roomEncryption) === null || _this$_roomEncryption === void 0 ? void 0 : _this$_roomEncryption.needsToShareKeys(memberChanges);
+	    }
+	  }, {
 	    key: "afterSyncCompleted",
 	    value: function () {
-	      var _afterSyncCompleted = _asyncToGenerator( regeneratorRuntime.mark(function _callee6(_ref4) {
+	      var _afterSyncCompleted = _asyncToGenerator( regeneratorRuntime.mark(function _callee6(_ref5) {
 	        var memberChanges;
 	        return regeneratorRuntime.wrap(function _callee6$(_context6) {
 	          while (1) {
 	            switch (_context6.prev = _context6.next) {
 	              case 0:
-	                memberChanges = _ref4.memberChanges;
+	                memberChanges = _ref5.memberChanges;
 	                if (!this._roomEncryption) {
 	                  _context6.next = 4;
 	                  break;
@@ -13999,7 +14193,7 @@ var hydrogenBundle = (function (exports) {
 	          }
 	        }, _callee6, this);
 	      }));
-	      function afterSyncCompleted(_x12) {
+	      function afterSyncCompleted(_x11) {
 	        return _afterSyncCompleted.apply(this, arguments);
 	      }
 	      return afterSyncCompleted;
@@ -14077,7 +14271,7 @@ var hydrogenBundle = (function (exports) {
 	          }
 	        }, _callee8, this, [[0, 12]]);
 	      }));
-	      function load(_x13, _x14) {
+	      function load(_x12, _x13) {
 	        return _load.apply(this, arguments);
 	      }
 	      return load;
@@ -14140,7 +14334,7 @@ var hydrogenBundle = (function (exports) {
 	    key: "fillGap",
 	    value: function () {
 	      var _fillGap = _asyncToGenerator( regeneratorRuntime.mark(function _callee10(fragmentEntry, amount) {
-	        var response, stores, txn, removedPendingEvents, gapResult, gapWriter, _iterator3, _step3, fragment;
+	        var response, txn, removedPendingEvents, gapResult, gapWriter, decryptRequest, _iterator3, _step3, fragment;
 	        return regeneratorRuntime.wrap(function _callee10$(_context10) {
 	          while (1) {
 	            switch (_context10.prev = _context10.next) {
@@ -14163,45 +14357,40 @@ var hydrogenBundle = (function (exports) {
 	                }).response();
 	              case 4:
 	                response = _context10.sent;
-	                stores = [this._storage.storeNames.pendingEvents, this._storage.storeNames.timelineEvents, this._storage.storeNames.timelineFragments];
-	                if (this._roomEncryption) {
-	                  stores = stores.concat([this._storage.storeNames.inboundGroupSessions, this._storage.storeNames.groupSessionDecryptions, this._storage.storeNames.deviceIdentities]);
-	                }
-	                _context10.next = 9;
-	                return this._storage.readWriteTxn(stores);
-	              case 9:
+	                _context10.next = 7;
+	                return this._storage.readWriteTxn([this._storage.storeNames.pendingEvents, this._storage.storeNames.timelineEvents, this._storage.storeNames.timelineFragments]);
+	              case 7:
 	                txn = _context10.sent;
-	                _context10.prev = 10;
+	                _context10.prev = 8;
 	                removedPendingEvents = this._sendQueue.removeRemoteEchos(response.chunk, txn);
 	                gapWriter = new GapWriter({
 	                  roomId: this._roomId,
 	                  storage: this._storage,
 	                  fragmentIdComparer: this._fragmentIdComparer
 	                });
-	                _context10.next = 15;
+	                _context10.next = 13;
 	                return gapWriter.writeFragmentFill(fragmentEntry, response, txn);
-	              case 15:
+	              case 13:
 	                gapResult = _context10.sent;
-	                if (!this._roomEncryption) {
-	                  _context10.next = 20;
-	                  break;
-	                }
-	                _context10.next = 19;
-	                return this._decryptEntries(gapResult.entries, txn, false);
-	              case 19:
-	                gapResult.entries = _context10.sent;
-	              case 20:
-	                _context10.next = 26;
+	                _context10.next = 20;
 	                break;
-	              case 22:
-	                _context10.prev = 22;
-	                _context10.t0 = _context10["catch"](10);
+	              case 16:
+	                _context10.prev = 16;
+	                _context10.t0 = _context10["catch"](8);
 	                txn.abort();
 	                throw _context10.t0;
-	              case 26:
-	                _context10.next = 28;
+	              case 20:
+	                _context10.next = 22;
 	                return txn.complete();
-	              case 28:
+	              case 22:
+	                if (!this._roomEncryption) {
+	                  _context10.next = 26;
+	                  break;
+	                }
+	                decryptRequest = this._decryptEntries(DecryptionSource.Timeline, gapResult.entries);
+	                _context10.next = 26;
+	                return decryptRequest.complete();
+	              case 26:
 	                _iterator3 = _createForOfIteratorHelper(gapResult.fragments);
 	                try {
 	                  for (_iterator3.s(); !(_step3 = _iterator3.n()).done;) {
@@ -14219,14 +14408,14 @@ var hydrogenBundle = (function (exports) {
 	                if (this._timeline) {
 	                  this._timeline.addGapEntries(gapResult.entries);
 	                }
-	              case 32:
+	              case 30:
 	              case "end":
 	                return _context10.stop();
 	            }
 	          }
-	        }, _callee10, this, [[10, 22]]);
+	        }, _callee10, this, [[8, 16]]);
 	      }));
-	      function fillGap(_x15, _x16) {
+	      function fillGap(_x14, _x15) {
 	        return _fillGap.apply(this, arguments);
 	      }
 	      return fillGap;
@@ -14335,53 +14524,31 @@ var hydrogenBundle = (function (exports) {
 	    }()
 	  }, {
 	    key: "openTimeline",
-	    value: function () {
-	      var _openTimeline = _asyncToGenerator( regeneratorRuntime.mark(function _callee13() {
-	        var _this4 = this;
-	        return regeneratorRuntime.wrap(function _callee13$(_context13) {
-	          while (1) {
-	            switch (_context13.prev = _context13.next) {
-	              case 0:
-	                if (!this._timeline) {
-	                  _context13.next = 2;
-	                  break;
-	                }
-	                throw new Error("not dealing with load race here for now");
-	              case 2:
-	                console.log("opening the timeline for ".concat(this._roomId));
-	                this._timeline = new Timeline({
-	                  roomId: this.id,
-	                  storage: this._storage,
-	                  fragmentIdComparer: this._fragmentIdComparer,
-	                  pendingEvents: this._sendQueue.pendingEvents,
-	                  closeCallback: function closeCallback() {
-	                    console.log("closing the timeline for ".concat(_this4._roomId));
-	                    _this4._timeline = null;
-	                    if (_this4._roomEncryption) {
-	                      _this4._roomEncryption.notifyTimelineClosed();
-	                    }
-	                  },
-	                  user: this._user
-	                });
-	                if (this._roomEncryption) {
-	                  this._timeline.enableEncryption(this._decryptEntries.bind(this));
-	                }
-	                _context13.next = 7;
-	                return this._timeline.load();
-	              case 7:
-	                return _context13.abrupt("return", this._timeline);
-	              case 8:
-	              case "end":
-	                return _context13.stop();
-	            }
-	          }
-	        }, _callee13, this);
-	      }));
-	      function openTimeline() {
-	        return _openTimeline.apply(this, arguments);
+	    value: function openTimeline() {
+	      var _this4 = this;
+	      if (this._timeline) {
+	        throw new Error("not dealing with load race here for now");
 	      }
-	      return openTimeline;
-	    }()
+	      console.log("opening the timeline for ".concat(this._roomId));
+	      this._timeline = new Timeline({
+	        roomId: this.id,
+	        storage: this._storage,
+	        fragmentIdComparer: this._fragmentIdComparer,
+	        pendingEvents: this._sendQueue.pendingEvents,
+	        closeCallback: function closeCallback() {
+	          console.log("closing the timeline for ".concat(_this4._roomId));
+	          _this4._timeline = null;
+	          if (_this4._roomEncryption) {
+	            _this4._roomEncryption.notifyTimelineClosed();
+	          }
+	        },
+	        user: this._user
+	      });
+	      if (this._roomEncryption) {
+	        this._timeline.enableEncryption(this._decryptEntries.bind(this, DecryptionSource.Timeline));
+	      }
+	      return this._timeline;
+	    }
 	  }, {
 	    key: "writeIsTrackingMembers",
 	    value: function writeIsTrackingMembers(value, txn) {
@@ -14391,6 +14558,11 @@ var hydrogenBundle = (function (exports) {
 	    key: "applyIsTrackingMembersChanges",
 	    value: function applyIsTrackingMembersChanges(changes) {
 	      this._summary.applyChanges(changes);
+	    }
+	  }, {
+	    key: "needsPrepareSync",
+	    get: function get() {
+	      return !!this._roomEncryption;
 	    }
 	  }, {
 	    key: "name",
@@ -14452,6 +14624,11 @@ var hydrogenBundle = (function (exports) {
 	      return this._summary.isTrackingMembers;
 	    }
 	  }, {
+	    key: "_isTimelineOpen",
+	    get: function get() {
+	      return !!this._timeline;
+	    }
+	  }, {
 	    key: "mediaRepository",
 	    get: function get() {
 	      return this._hsApi.mediaRepository;
@@ -14459,6 +14636,34 @@ var hydrogenBundle = (function (exports) {
 	  }]);
 	  return Room;
 	}(EventEmitter);
+	var DecryptionRequest = function () {
+	  function DecryptionRequest(decryptFn) {
+	    _classCallCheck(this, DecryptionRequest);
+	    this._cancelled = false;
+	    this.preparation = null;
+	    this._promise = decryptFn(this);
+	  }
+	  _createClass(DecryptionRequest, [{
+	    key: "complete",
+	    value: function complete() {
+	      return this._promise;
+	    }
+	  }, {
+	    key: "dispose",
+	    value: function dispose() {
+	      this._cancelled = true;
+	      if (this.preparation) {
+	        this.preparation.dispose();
+	      }
+	    }
+	  }, {
+	    key: "cancelled",
+	    get: function get() {
+	      return this._cancelled;
+	    }
+	  }]);
+	  return DecryptionRequest;
+	}();
 
 	var RateLimitingBackoff = function () {
 	  function RateLimitingBackoff() {
@@ -16388,136 +16593,115 @@ var hydrogenBundle = (function (exports) {
 	  this.device = device;
 	};
 
-	var CACHE_MAX_SIZE = 10;
-	var Decryption$1 = function () {
-	  function Decryption(_ref) {
-	    var pickleKey = _ref.pickleKey,
-	        olm = _ref.olm;
-	    _classCallCheck(this, Decryption);
-	    this._pickleKey = pickleKey;
-	    this._olm = olm;
+	var SessionInfo = function () {
+	  function SessionInfo(roomId, senderKey, session, claimedKeys) {
+	    _classCallCheck(this, SessionInfo);
+	    this.roomId = roomId;
+	    this.senderKey = senderKey;
+	    this.session = session;
+	    this.claimedKeys = claimedKeys;
+	    this._refCounter = 0;
 	  }
-	  _createClass(Decryption, [{
-	    key: "createSessionCache",
-	    value: function createSessionCache() {
-	      return new SessionCache();
+	  _createClass(SessionInfo, [{
+	    key: "retain",
+	    value: function retain() {
+	      this._refCounter += 1;
 	    }
 	  }, {
-	    key: "decrypt",
-	    value: function () {
-	      var _decrypt = _asyncToGenerator( regeneratorRuntime.mark(function _callee(roomId, event, sessionCache, txn) {
-	        var _event$content, _event$content2, _event$content3;
-	        var senderKey, sessionId, ciphertext, session, claimedKeys, cacheEntry, sessionEntry, _session$decrypt, plaintext, messageIndex, payload;
-	        return regeneratorRuntime.wrap(function _callee$(_context) {
-	          while (1) {
-	            switch (_context.prev = _context.next) {
-	              case 0:
-	                senderKey = (_event$content = event.content) === null || _event$content === void 0 ? void 0 : _event$content["sender_key"];
-	                sessionId = (_event$content2 = event.content) === null || _event$content2 === void 0 ? void 0 : _event$content2["session_id"];
-	                ciphertext = (_event$content3 = event.content) === null || _event$content3 === void 0 ? void 0 : _event$content3.ciphertext;
-	                if (!(typeof senderKey !== "string" || typeof sessionId !== "string" || typeof ciphertext !== "string")) {
-	                  _context.next = 5;
-	                  break;
-	                }
-	                throw new DecryptionError("MEGOLM_INVALID_EVENT", event);
-	              case 5:
-	                cacheEntry = sessionCache.get(roomId, senderKey, sessionId);
-	                if (!cacheEntry) {
-	                  _context.next = 11;
-	                  break;
-	                }
-	                session = cacheEntry.session;
-	                claimedKeys = cacheEntry.claimedKeys;
-	                _context.next = 26;
-	                break;
-	              case 11:
-	                _context.next = 13;
-	                return txn.inboundGroupSessions.get(roomId, senderKey, sessionId);
-	              case 13:
-	                sessionEntry = _context.sent;
-	                if (!sessionEntry) {
-	                  _context.next = 26;
-	                  break;
-	                }
-	                session = new this._olm.InboundGroupSession();
-	                _context.prev = 16;
-	                session.unpickle(this._pickleKey, sessionEntry.session);
-	                _context.next = 24;
-	                break;
-	              case 20:
-	                _context.prev = 20;
-	                _context.t0 = _context["catch"](16);
-	                session.free();
-	                throw _context.t0;
-	              case 24:
-	                claimedKeys = sessionEntry.claimedKeys;
-	                sessionCache.add(roomId, senderKey, session, claimedKeys);
-	              case 26:
-	                if (session) {
-	                  _context.next = 28;
-	                  break;
-	                }
-	                return _context.abrupt("return");
-	              case 28:
-	                _session$decrypt = session.decrypt(ciphertext), plaintext = _session$decrypt.plaintext, messageIndex = _session$decrypt.message_index;
-	                _context.prev = 29;
-	                payload = JSON.parse(plaintext);
-	                _context.next = 36;
-	                break;
-	              case 33:
-	                _context.prev = 33;
-	                _context.t1 = _context["catch"](29);
-	                throw new DecryptionError("PLAINTEXT_NOT_JSON", event, {
-	                  plaintext: plaintext,
-	                  err: _context.t1
-	                });
-	              case 36:
-	                if (!(payload.room_id !== roomId)) {
-	                  _context.next = 38;
-	                  break;
-	                }
-	                throw new DecryptionError("MEGOLM_WRONG_ROOM", event, {
-	                  encryptedRoomId: payload.room_id,
-	                  eventRoomId: roomId
-	                });
-	              case 38:
-	                _context.next = 40;
-	                return this._handleReplayAttack(roomId, sessionId, messageIndex, event, txn);
-	              case 40:
-	                return _context.abrupt("return", new DecryptionResult(payload, senderKey, claimedKeys));
-	              case 41:
-	              case "end":
-	                return _context.stop();
-	            }
-	          }
-	        }, _callee, this, [[16, 20], [29, 33]]);
-	      }));
-	      function decrypt(_x, _x2, _x3, _x4) {
-	        return _decrypt.apply(this, arguments);
+	    key: "release",
+	    value: function release() {
+	      this._refCounter -= 1;
+	      if (this._refCounter <= 0) {
+	        this.dispose();
 	      }
-	      return decrypt;
-	    }()
+	    }
 	  }, {
-	    key: "_handleReplayAttack",
+	    key: "dispose",
+	    value: function dispose() {
+	      this.session.free();
+	    }
+	  }]);
+	  return SessionInfo;
+	}();
+
+	var DecryptionChanges$1 = function () {
+	  function DecryptionChanges(roomId, results, errors, replayEntries) {
+	    _classCallCheck(this, DecryptionChanges);
+	    this._roomId = roomId;
+	    this._results = results;
+	    this._errors = errors;
+	    this._replayEntries = replayEntries;
+	  }
+	  _createClass(DecryptionChanges, [{
+	    key: "write",
 	    value: function () {
-	      var _handleReplayAttack2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee2(roomId, sessionId, messageIndex, event, txn) {
-	        var eventId, timestamp, decryption, decryptedEventIsBad, badEventId;
+	      var _write = _asyncToGenerator( regeneratorRuntime.mark(function _callee2(txn) {
+	        var _this = this;
 	        return regeneratorRuntime.wrap(function _callee2$(_context2) {
 	          while (1) {
 	            switch (_context2.prev = _context2.next) {
 	              case 0:
-	                eventId = event.event_id;
-	                timestamp = event.origin_server_ts;
-	                _context2.next = 4;
+	                _context2.next = 2;
+	                return Promise.all(this._replayEntries.map( function () {
+	                  var _ref = _asyncToGenerator( regeneratorRuntime.mark(function _callee(replayEntry) {
+	                    return regeneratorRuntime.wrap(function _callee$(_context) {
+	                      while (1) {
+	                        switch (_context.prev = _context.next) {
+	                          case 0:
+	                            try {
+	                              _this._handleReplayAttack(_this._roomId, replayEntry, txn);
+	                            } catch (err) {
+	                              _this._errors.set(replayEntry.eventId, err);
+	                            }
+	                          case 1:
+	                          case "end":
+	                            return _context.stop();
+	                        }
+	                      }
+	                    }, _callee);
+	                  }));
+	                  return function (_x2) {
+	                    return _ref.apply(this, arguments);
+	                  };
+	                }()));
+	              case 2:
+	                return _context2.abrupt("return", {
+	                  results: this._results,
+	                  errors: this._errors
+	                });
+	              case 3:
+	              case "end":
+	                return _context2.stop();
+	            }
+	          }
+	        }, _callee2, this);
+	      }));
+	      function write(_x) {
+	        return _write.apply(this, arguments);
+	      }
+	      return write;
+	    }()
+	  }, {
+	    key: "_handleReplayAttack",
+	    value: function () {
+	      var _handleReplayAttack2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee3(roomId, replayEntry, txn) {
+	        var messageIndex, sessionId, eventId, timestamp, decryption, decryptedEventIsBad, badEventId;
+	        return regeneratorRuntime.wrap(function _callee3$(_context3) {
+	          while (1) {
+	            switch (_context3.prev = _context3.next) {
+	              case 0:
+	                messageIndex = replayEntry.messageIndex, sessionId = replayEntry.sessionId, eventId = replayEntry.eventId, timestamp = replayEntry.timestamp;
+	                _context3.next = 3;
 	                return txn.groupSessionDecryptions.get(roomId, sessionId, messageIndex);
-	              case 4:
-	                decryption = _context2.sent;
+	              case 3:
+	                decryption = _context3.sent;
 	                if (!(decryption && decryption.eventId !== eventId)) {
-	                  _context2.next = 9;
+	                  _context3.next = 9;
 	                  break;
 	                }
 	                decryptedEventIsBad = decryption.timestamp < timestamp;
 	                badEventId = decryptedEventIsBad ? eventId : decryption.eventId;
+	                this._results.delete(eventId);
 	                throw new DecryptionError("MEGOLM_REPLAYED_INDEX", event, {
 	                  messageIndex: messageIndex,
 	                  badEventId: badEventId,
@@ -16535,48 +16719,539 @@ var hydrogenBundle = (function (exports) {
 	                }
 	              case 10:
 	              case "end":
+	                return _context3.stop();
+	            }
+	          }
+	        }, _callee3, this);
+	      }));
+	      function _handleReplayAttack(_x3, _x4, _x5) {
+	        return _handleReplayAttack2.apply(this, arguments);
+	      }
+	      return _handleReplayAttack;
+	    }()
+	  }]);
+	  return DecryptionChanges;
+	}();
+
+	function mergeMap(src, dst) {
+	  if (src) {
+	    var _iterator = _createForOfIteratorHelper(src.entries()),
+	        _step;
+	    try {
+	      for (_iterator.s(); !(_step = _iterator.n()).done;) {
+	        var _step$value = _slicedToArray(_step.value, 2),
+	            key = _step$value[0],
+	            value = _step$value[1];
+	        dst.set(key, value);
+	      }
+	    } catch (err) {
+	      _iterator.e(err);
+	    } finally {
+	      _iterator.f();
+	    }
+	  }
+	}
+
+	var DecryptionPreparation = function () {
+	  function DecryptionPreparation(roomId, sessionDecryptions, errors) {
+	    _classCallCheck(this, DecryptionPreparation);
+	    this._roomId = roomId;
+	    this._sessionDecryptions = sessionDecryptions;
+	    this._initialErrors = errors;
+	  }
+	  _createClass(DecryptionPreparation, [{
+	    key: "decrypt",
+	    value: function () {
+	      var _decrypt = _asyncToGenerator( regeneratorRuntime.mark(function _callee2() {
+	        var errors, results, replayEntries;
+	        return regeneratorRuntime.wrap(function _callee2$(_context2) {
+	          while (1) {
+	            switch (_context2.prev = _context2.next) {
+	              case 0:
+	                _context2.prev = 0;
+	                errors = this._initialErrors;
+	                results = new Map();
+	                replayEntries = [];
+	                _context2.next = 6;
+	                return Promise.all(this._sessionDecryptions.map( function () {
+	                  var _ref = _asyncToGenerator( regeneratorRuntime.mark(function _callee(sessionDecryption) {
+	                    var sessionResult;
+	                    return regeneratorRuntime.wrap(function _callee$(_context) {
+	                      while (1) {
+	                        switch (_context.prev = _context.next) {
+	                          case 0:
+	                            _context.next = 2;
+	                            return sessionDecryption.decryptAll();
+	                          case 2:
+	                            sessionResult = _context.sent;
+	                            mergeMap(sessionResult.errors, errors);
+	                            mergeMap(sessionResult.results, results);
+	                            replayEntries.push.apply(replayEntries, _toConsumableArray(sessionResult.replayEntries));
+	                          case 6:
+	                          case "end":
+	                            return _context.stop();
+	                        }
+	                      }
+	                    }, _callee);
+	                  }));
+	                  return function (_x) {
+	                    return _ref.apply(this, arguments);
+	                  };
+	                }()));
+	              case 6:
+	                return _context2.abrupt("return", new DecryptionChanges$1(this._roomId, results, errors, replayEntries));
+	              case 7:
+	                _context2.prev = 7;
+	                this.dispose();
+	                return _context2.finish(7);
+	              case 10:
+	              case "end":
+	                return _context2.stop();
+	            }
+	          }
+	        }, _callee2, this, [[0,, 7, 10]]);
+	      }));
+	      function decrypt() {
+	        return _decrypt.apply(this, arguments);
+	      }
+	      return decrypt;
+	    }()
+	  }, {
+	    key: "dispose",
+	    value: function dispose() {
+	      var _iterator = _createForOfIteratorHelper(this._sessionDecryptions),
+	          _step;
+	      try {
+	        for (_iterator.s(); !(_step = _iterator.n()).done;) {
+	          var sd = _step.value;
+	          sd.dispose();
+	        }
+	      } catch (err) {
+	        _iterator.e(err);
+	      } finally {
+	        _iterator.f();
+	      }
+	    }
+	  }]);
+	  return DecryptionPreparation;
+	}();
+
+	var ReplayDetectionEntry = function ReplayDetectionEntry(sessionId, messageIndex, event) {
+	  _classCallCheck(this, ReplayDetectionEntry);
+	  this.sessionId = sessionId;
+	  this.messageIndex = messageIndex;
+	  this.eventId = event.event_id;
+	  this.timestamp = event.origin_server_ts;
+	};
+
+	var SessionDecryption = function () {
+	  function SessionDecryption(sessionInfo, events, decryptor) {
+	    _classCallCheck(this, SessionDecryption);
+	    sessionInfo.retain();
+	    this._sessionInfo = sessionInfo;
+	    this._events = events;
+	    this._decryptor = decryptor;
+	    this._decryptionRequests = decryptor ? [] : null;
+	  }
+	  _createClass(SessionDecryption, [{
+	    key: "decryptAll",
+	    value: function () {
+	      var _decryptAll = _asyncToGenerator( regeneratorRuntime.mark(function _callee2() {
+	        var _this = this;
+	        var replayEntries, results, errors, roomId;
+	        return regeneratorRuntime.wrap(function _callee2$(_context2) {
+	          while (1) {
+	            switch (_context2.prev = _context2.next) {
+	              case 0:
+	                replayEntries = [];
+	                results = new Map();
+	                roomId = this._sessionInfo.roomId;
+	                _context2.next = 5;
+	                return Promise.all(this._events.map( function () {
+	                  var _ref = _asyncToGenerator( regeneratorRuntime.mark(function _callee(event) {
+	                    var session, ciphertext, decryptionResult, request, plaintext, messageIndex, payload, result;
+	                    return regeneratorRuntime.wrap(function _callee$(_context) {
+	                      while (1) {
+	                        switch (_context.prev = _context.next) {
+	                          case 0:
+	                            _context.prev = 0;
+	                            session = _this._sessionInfo.session;
+	                            ciphertext = event.content.ciphertext;
+	                            if (!_this._decryptor) {
+	                              _context.next = 11;
+	                              break;
+	                            }
+	                            request = _this._decryptor.decrypt(session, ciphertext);
+	                            _this._decryptionRequests.push(request);
+	                            _context.next = 8;
+	                            return request.response();
+	                          case 8:
+	                            decryptionResult = _context.sent;
+	                            _context.next = 12;
+	                            break;
+	                          case 11:
+	                            decryptionResult = session.decrypt(ciphertext);
+	                          case 12:
+	                            plaintext = decryptionResult.plaintext;
+	                            messageIndex = decryptionResult.message_index;
+	                            _context.prev = 14;
+	                            payload = JSON.parse(plaintext);
+	                            _context.next = 21;
+	                            break;
+	                          case 18:
+	                            _context.prev = 18;
+	                            _context.t0 = _context["catch"](14);
+	                            throw new DecryptionError("PLAINTEXT_NOT_JSON", event, {
+	                              plaintext: plaintext,
+	                              err: _context.t0
+	                            });
+	                          case 21:
+	                            if (!(payload.room_id !== roomId)) {
+	                              _context.next = 23;
+	                              break;
+	                            }
+	                            throw new DecryptionError("MEGOLM_WRONG_ROOM", event, {
+	                              encryptedRoomId: payload.room_id,
+	                              eventRoomId: roomId
+	                            });
+	                          case 23:
+	                            replayEntries.push(new ReplayDetectionEntry(session.session_id(), messageIndex, event));
+	                            result = new DecryptionResult(payload, _this._sessionInfo.senderKey, _this._sessionInfo.claimedKeys);
+	                            results.set(event.event_id, result);
+	                            _context.next = 34;
+	                            break;
+	                          case 28:
+	                            _context.prev = 28;
+	                            _context.t1 = _context["catch"](0);
+	                            if (!(_context.t1.name === "AbortError")) {
+	                              _context.next = 32;
+	                              break;
+	                            }
+	                            return _context.abrupt("return");
+	                          case 32:
+	                            if (!errors) {
+	                              errors = new Map();
+	                            }
+	                            errors.set(event.event_id, _context.t1);
+	                          case 34:
+	                          case "end":
+	                            return _context.stop();
+	                        }
+	                      }
+	                    }, _callee, null, [[0, 28], [14, 18]]);
+	                  }));
+	                  return function (_x) {
+	                    return _ref.apply(this, arguments);
+	                  };
+	                }()));
+	              case 5:
+	                return _context2.abrupt("return", {
+	                  results: results,
+	                  errors: errors,
+	                  replayEntries: replayEntries
+	                });
+	              case 6:
+	              case "end":
+	                return _context2.stop();
+	            }
+	          }
+	        }, _callee2, this);
+	      }));
+	      function decryptAll() {
+	        return _decryptAll.apply(this, arguments);
+	      }
+	      return decryptAll;
+	    }()
+	  }, {
+	    key: "dispose",
+	    value: function dispose() {
+	      if (this._decryptionRequests) {
+	        var _iterator = _createForOfIteratorHelper(this._decryptionRequests),
+	            _step;
+	        try {
+	          for (_iterator.s(); !(_step = _iterator.n()).done;) {
+	            var r = _step.value;
+	            r.abort();
+	          }
+	        } catch (err) {
+	          _iterator.e(err);
+	        } finally {
+	          _iterator.f();
+	        }
+	      }
+	      this._sessionInfo.release();
+	    }
+	  }]);
+	  return SessionDecryption;
+	}();
+
+	var CACHE_MAX_SIZE = 10;
+	var SessionCache = function () {
+	  function SessionCache() {
+	    _classCallCheck(this, SessionCache);
+	    this._sessions = [];
+	  }
+	  _createClass(SessionCache, [{
+	    key: "get",
+	    value: function get(roomId, senderKey, sessionId) {
+	      var idx = this._sessions.findIndex(function (s) {
+	        return s.roomId === roomId && s.senderKey === senderKey && sessionId === s.session.session_id();
+	      });
+	      if (idx !== -1) {
+	        var sessionInfo = this._sessions[idx];
+	        if (idx > 0) {
+	          this._sessions.splice(idx, 1);
+	          this._sessions.unshift(sessionInfo);
+	        }
+	        return sessionInfo;
+	      }
+	    }
+	  }, {
+	    key: "add",
+	    value: function add(sessionInfo) {
+	      sessionInfo.retain();
+	      this._sessions.unshift(sessionInfo);
+	      if (this._sessions.length > CACHE_MAX_SIZE) {
+	        for (var i = CACHE_MAX_SIZE; i < this._sessions.length; i += 1) {
+	          this._sessions[i].release();
+	        }
+	        this._sessions = this._sessions.slice(0, CACHE_MAX_SIZE);
+	      }
+	    }
+	  }, {
+	    key: "dispose",
+	    value: function dispose() {
+	      var _iterator = _createForOfIteratorHelper(this._sessions),
+	          _step;
+	      try {
+	        for (_iterator.s(); !(_step = _iterator.n()).done;) {
+	          var sessionInfo = _step.value;
+	          sessionInfo.release();
+	        }
+	      } catch (err) {
+	        _iterator.e(err);
+	      } finally {
+	        _iterator.f();
+	      }
+	    }
+	  }]);
+	  return SessionCache;
+	}();
+
+	var DecryptionWorker = function () {
+	  function DecryptionWorker(workerPool) {
+	    _classCallCheck(this, DecryptionWorker);
+	    this._workerPool = workerPool;
+	  }
+	  _createClass(DecryptionWorker, [{
+	    key: "decrypt",
+	    value: function decrypt(session, ciphertext) {
+	      var sessionKey = session.export_session(session.first_known_index());
+	      return this._workerPool.send({
+	        type: "megolm_decrypt",
+	        ciphertext: ciphertext,
+	        sessionKey: sessionKey
+	      });
+	    }
+	  }]);
+	  return DecryptionWorker;
+	}();
+
+	function getSenderKey(event) {
+	  var _event$content;
+	  return (_event$content = event.content) === null || _event$content === void 0 ? void 0 : _event$content["sender_key"];
+	}
+	function getSessionId(event) {
+	  var _event$content2;
+	  return (_event$content2 = event.content) === null || _event$content2 === void 0 ? void 0 : _event$content2["session_id"];
+	}
+	function getCiphertext(event) {
+	  var _event$content3;
+	  return (_event$content3 = event.content) === null || _event$content3 === void 0 ? void 0 : _event$content3.ciphertext;
+	}
+	var Decryption$1 = function () {
+	  function Decryption(_ref) {
+	    var pickleKey = _ref.pickleKey,
+	        olm = _ref.olm,
+	        workerPool = _ref.workerPool;
+	    _classCallCheck(this, Decryption);
+	    this._pickleKey = pickleKey;
+	    this._olm = olm;
+	    this._decryptor = workerPool ? new DecryptionWorker(workerPool) : null;
+	  }
+	  _createClass(Decryption, [{
+	    key: "createSessionCache",
+	    value: function createSessionCache(fallback) {
+	      return new SessionCache(fallback);
+	    }
+	  }, {
+	    key: "prepareDecryptAll",
+	    value: function () {
+	      var _prepareDecryptAll = _asyncToGenerator( regeneratorRuntime.mark(function _callee2(roomId, events, sessionCache, txn) {
+	        var _this = this;
+	        var errors, validEvents, _iterator, _step, event, isValid, eventsBySession, sessionDecryptions;
+	        return regeneratorRuntime.wrap(function _callee2$(_context2) {
+	          while (1) {
+	            switch (_context2.prev = _context2.next) {
+	              case 0:
+	                errors = new Map();
+	                validEvents = [];
+	                _iterator = _createForOfIteratorHelper(events);
+	                try {
+	                  for (_iterator.s(); !(_step = _iterator.n()).done;) {
+	                    event = _step.value;
+	                    isValid = typeof getSenderKey(event) === "string" && typeof getSessionId(event) === "string" && typeof getCiphertext(event) === "string";
+	                    if (isValid) {
+	                      validEvents.push(event);
+	                    } else {
+	                      errors.set(event.event_id, new DecryptionError("MEGOLM_INVALID_EVENT", event));
+	                    }
+	                  }
+	                } catch (err) {
+	                  _iterator.e(err);
+	                } finally {
+	                  _iterator.f();
+	                }
+	                eventsBySession = groupBy(validEvents, function (event) {
+	                  return "".concat(getSenderKey(event), "|").concat(getSessionId(event));
+	                });
+	                sessionDecryptions = [];
+	                _context2.next = 8;
+	                return Promise.all(Array.from(eventsBySession.values()).map( function () {
+	                  var _ref2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee(eventsForSession) {
+	                    var first, senderKey, sessionId, sessionInfo, _iterator2, _step2, event;
+	                    return regeneratorRuntime.wrap(function _callee$(_context) {
+	                      while (1) {
+	                        switch (_context.prev = _context.next) {
+	                          case 0:
+	                            first = eventsForSession[0];
+	                            senderKey = getSenderKey(first);
+	                            sessionId = getSessionId(first);
+	                            _context.next = 5;
+	                            return _this._getSessionInfo(roomId, senderKey, sessionId, sessionCache, txn);
+	                          case 5:
+	                            sessionInfo = _context.sent;
+	                            if (!sessionInfo) {
+	                              _iterator2 = _createForOfIteratorHelper(eventsForSession);
+	                              try {
+	                                for (_iterator2.s(); !(_step2 = _iterator2.n()).done;) {
+	                                  event = _step2.value;
+	                                  errors.set(event.event_id, new DecryptionError("MEGOLM_NO_SESSION", event));
+	                                }
+	                              } catch (err) {
+	                                _iterator2.e(err);
+	                              } finally {
+	                                _iterator2.f();
+	                              }
+	                            } else {
+	                              sessionDecryptions.push(new SessionDecryption(sessionInfo, eventsForSession, _this._decryptor));
+	                            }
+	                          case 7:
+	                          case "end":
+	                            return _context.stop();
+	                        }
+	                      }
+	                    }, _callee);
+	                  }));
+	                  return function (_x5) {
+	                    return _ref2.apply(this, arguments);
+	                  };
+	                }()));
+	              case 8:
+	                return _context2.abrupt("return", new DecryptionPreparation(roomId, sessionDecryptions, errors));
+	              case 9:
+	              case "end":
 	                return _context2.stop();
 	            }
 	          }
 	        }, _callee2);
 	      }));
-	      function _handleReplayAttack(_x5, _x6, _x7, _x8, _x9) {
-	        return _handleReplayAttack2.apply(this, arguments);
+	      function prepareDecryptAll(_x, _x2, _x3, _x4) {
+	        return _prepareDecryptAll.apply(this, arguments);
 	      }
-	      return _handleReplayAttack;
+	      return prepareDecryptAll;
 	    }()
 	  }, {
-	    key: "addRoomKeys",
+	    key: "_getSessionInfo",
 	    value: function () {
-	      var _addRoomKeys = _asyncToGenerator( regeneratorRuntime.mark(function _callee3(decryptionResults, txn) {
-	        var newSessions, _iterator, _step, _event$content4, _event$content5, _event$content6, _step$value, senderKey, event, claimedEd25519Key, roomId, sessionId, sessionKey, hasSession, session, sessionEntry;
+	      var _getSessionInfo2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee3(roomId, senderKey, sessionId, sessionCache, txn) {
+	        var sessionInfo, sessionEntry, session;
 	        return regeneratorRuntime.wrap(function _callee3$(_context3) {
 	          while (1) {
 	            switch (_context3.prev = _context3.next) {
 	              case 0:
-	                newSessions = [];
-	                _iterator = _createForOfIteratorHelper(decryptionResults);
-	                _context3.prev = 2;
-	                _iterator.s();
-	              case 4:
-	                if ((_step = _iterator.n()).done) {
+	                sessionInfo = sessionCache.get(roomId, senderKey, sessionId);
+	                if (sessionInfo) {
 	                  _context3.next = 17;
 	                  break;
 	                }
-	                _step$value = _step.value, senderKey = _step$value.senderCurve25519Key, event = _step$value.event, claimedEd25519Key = _step$value.claimedEd25519Key;
+	                _context3.next = 4;
+	                return txn.inboundGroupSessions.get(roomId, senderKey, sessionId);
+	              case 4:
+	                sessionEntry = _context3.sent;
+	                if (!sessionEntry) {
+	                  _context3.next = 17;
+	                  break;
+	                }
+	                session = new this._olm.InboundGroupSession();
+	                _context3.prev = 7;
+	                session.unpickle(this._pickleKey, sessionEntry.session);
+	                sessionInfo = new SessionInfo(roomId, senderKey, session, sessionEntry.claimedKeys);
+	                _context3.next = 16;
+	                break;
+	              case 12:
+	                _context3.prev = 12;
+	                _context3.t0 = _context3["catch"](7);
+	                session.free();
+	                throw _context3.t0;
+	              case 16:
+	                sessionCache.add(sessionInfo);
+	              case 17:
+	                return _context3.abrupt("return", sessionInfo);
+	              case 18:
+	              case "end":
+	                return _context3.stop();
+	            }
+	          }
+	        }, _callee3, this, [[7, 12]]);
+	      }));
+	      function _getSessionInfo(_x6, _x7, _x8, _x9, _x10) {
+	        return _getSessionInfo2.apply(this, arguments);
+	      }
+	      return _getSessionInfo;
+	    }()
+	  }, {
+	    key: "addRoomKeys",
+	    value: function () {
+	      var _addRoomKeys = _asyncToGenerator( regeneratorRuntime.mark(function _callee4(decryptionResults, txn) {
+	        var newSessions, _iterator3, _step3, _event$content4, _event$content5, _event$content6, _step3$value, senderKey, event, claimedEd25519Key, roomId, sessionId, sessionKey, hasSession, session, sessionEntry;
+	        return regeneratorRuntime.wrap(function _callee4$(_context4) {
+	          while (1) {
+	            switch (_context4.prev = _context4.next) {
+	              case 0:
+	                newSessions = [];
+	                _iterator3 = _createForOfIteratorHelper(decryptionResults);
+	                _context4.prev = 2;
+	                _iterator3.s();
+	              case 4:
+	                if ((_step3 = _iterator3.n()).done) {
+	                  _context4.next = 17;
+	                  break;
+	                }
+	                _step3$value = _step3.value, senderKey = _step3$value.senderCurve25519Key, event = _step3$value.event, claimedEd25519Key = _step3$value.claimedEd25519Key;
 	                roomId = (_event$content4 = event.content) === null || _event$content4 === void 0 ? void 0 : _event$content4["room_id"];
 	                sessionId = (_event$content5 = event.content) === null || _event$content5 === void 0 ? void 0 : _event$content5["session_id"];
 	                sessionKey = (_event$content6 = event.content) === null || _event$content6 === void 0 ? void 0 : _event$content6["session_key"];
 	                if (!(typeof roomId !== "string" || typeof sessionId !== "string" || typeof senderKey !== "string" || typeof sessionKey !== "string")) {
-	                  _context3.next = 11;
+	                  _context4.next = 11;
 	                  break;
 	                }
-	                return _context3.abrupt("return");
+	                return _context4.abrupt("return");
 	              case 11:
-	                _context3.next = 13;
+	                _context4.next = 13;
 	                return txn.inboundGroupSessions.has(roomId, senderKey, sessionId);
 	              case 13:
-	                hasSession = _context3.sent;
+	                hasSession = _context4.sent;
 	                if (!hasSession) {
 	                  session = new this._olm.InboundGroupSession();
 	                  try {
@@ -16597,90 +17272,35 @@ var hydrogenBundle = (function (exports) {
 	                  }
 	                }
 	              case 15:
-	                _context3.next = 4;
+	                _context4.next = 4;
 	                break;
 	              case 17:
-	                _context3.next = 22;
+	                _context4.next = 22;
 	                break;
 	              case 19:
-	                _context3.prev = 19;
-	                _context3.t0 = _context3["catch"](2);
-	                _iterator.e(_context3.t0);
+	                _context4.prev = 19;
+	                _context4.t0 = _context4["catch"](2);
+	                _iterator3.e(_context4.t0);
 	              case 22:
-	                _context3.prev = 22;
-	                _iterator.f();
-	                return _context3.finish(22);
+	                _context4.prev = 22;
+	                _iterator3.f();
+	                return _context4.finish(22);
 	              case 25:
-	                return _context3.abrupt("return", newSessions);
+	                return _context4.abrupt("return", newSessions);
 	              case 26:
 	              case "end":
-	                return _context3.stop();
+	                return _context4.stop();
 	            }
 	          }
-	        }, _callee3, this, [[2, 19, 22, 25]]);
+	        }, _callee4, this, [[2, 19, 22, 25]]);
 	      }));
-	      function addRoomKeys(_x10, _x11) {
+	      function addRoomKeys(_x11, _x12) {
 	        return _addRoomKeys.apply(this, arguments);
 	      }
 	      return addRoomKeys;
 	    }()
 	  }]);
 	  return Decryption;
-	}();
-	var SessionCache = function () {
-	  function SessionCache() {
-	    _classCallCheck(this, SessionCache);
-	    this._sessions = [];
-	  }
-	  _createClass(SessionCache, [{
-	    key: "get",
-	    value: function get(roomId, senderKey, sessionId) {
-	      var idx = this._sessions.findIndex(function (s) {
-	        return s.roomId === roomId && s.senderKey === senderKey && sessionId === s.session.session_id();
-	      });
-	      if (idx !== -1) {
-	        var entry = this._sessions[idx];
-	        if (idx > 0) {
-	          this._sessions.splice(idx, 1);
-	          this._sessions.unshift(entry);
-	        }
-	        return entry;
-	      }
-	    }
-	  }, {
-	    key: "add",
-	    value: function add(roomId, senderKey, session, claimedKeys) {
-	      this._sessions.unshift({
-	        roomId: roomId,
-	        senderKey: senderKey,
-	        session: session,
-	        claimedKeys: claimedKeys
-	      });
-	      if (this._sessions.length > CACHE_MAX_SIZE) {
-	        for (var i = CACHE_MAX_SIZE; i < this._sessions.length; i += 1) {
-	          this._sessions[i].session.free();
-	        }
-	        this._sessions = this._sessions.slice(0, CACHE_MAX_SIZE);
-	      }
-	    }
-	  }, {
-	    key: "dispose",
-	    value: function dispose() {
-	      var _iterator2 = _createForOfIteratorHelper(this._sessions),
-	          _step2;
-	      try {
-	        for (_iterator2.s(); !(_step2 = _iterator2.n()).done;) {
-	          var entry = _step2.value;
-	          entry.session.free();
-	        }
-	      } catch (err) {
-	        _iterator2.e(err);
-	      } finally {
-	        _iterator2.f();
-	      }
-	    }
-	  }]);
-	  return SessionCache;
 	}();
 
 	var Encryption$1 = function () {
@@ -16974,73 +17594,180 @@ var hydrogenBundle = (function (exports) {
 	      return writeMemberChanges;
 	    }()
 	  }, {
-	    key: "decrypt",
+	    key: "prepareDecryptAll",
 	    value: function () {
-	      var _decrypt = _asyncToGenerator( regeneratorRuntime.mark(function _callee2(event, isSync, isTimelineOpen, retryData, txn) {
-	        var _event$unsigned, _event$content;
-	        var _event$content2, sessionCache, result;
+	      var _prepareDecryptAll = _asyncToGenerator( regeneratorRuntime.mark(function _callee2(events, source, isTimelineOpen, txn) {
+	        var errors, validEvents, _iterator2, _step2, _event$unsigned, _event$content, event, _event$content2, customCache, sessionCache, preparation;
 	        return regeneratorRuntime.wrap(function _callee2$(_context2) {
 	          while (1) {
 	            switch (_context2.prev = _context2.next) {
 	              case 0:
+	                errors = [];
+	                validEvents = [];
+	                _iterator2 = _createForOfIteratorHelper(events);
+	                _context2.prev = 3;
+	                _iterator2.s();
+	              case 5:
+	                if ((_step2 = _iterator2.n()).done) {
+	                  _context2.next = 13;
+	                  break;
+	                }
+	                event = _step2.value;
 	                if (!(event.redacted_because || ((_event$unsigned = event.unsigned) === null || _event$unsigned === void 0 ? void 0 : _event$unsigned.redacted_because))) {
-	                  _context2.next = 2;
+	                  _context2.next = 9;
 	                  break;
 	                }
-	                return _context2.abrupt("return");
-	              case 2:
-	                if (!(((_event$content = event.content) === null || _event$content === void 0 ? void 0 : _event$content.algorithm) !== MEGOLM_ALGORITHM)) {
-	                  _context2.next = 4;
-	                  break;
+	                return _context2.abrupt("continue", 11);
+	              case 9:
+	                if (((_event$content = event.content) === null || _event$content === void 0 ? void 0 : _event$content.algorithm) !== MEGOLM_ALGORITHM) {
+	                  errors.set(event.event_id, new Error("Unsupported algorithm: " + ((_event$content2 = event.content) === null || _event$content2 === void 0 ? void 0 : _event$content2.algorithm)));
 	                }
-	                throw new Error("Unsupported algorithm: " + ((_event$content2 = event.content) === null || _event$content2 === void 0 ? void 0 : _event$content2.algorithm));
-	              case 4:
-	                sessionCache = isSync ? this._megolmSyncCache : this._megolmBackfillCache;
-	                _context2.next = 7;
-	                return this._megolmDecryption.decrypt(this._room.id, event, sessionCache, txn);
-	              case 7:
-	                result = _context2.sent;
-	                if (!result) {
-	                  this._addMissingSessionEvent(event, isSync, retryData);
-	                }
-	                if (!(result && isTimelineOpen)) {
-	                  _context2.next = 12;
-	                  break;
-	                }
-	                _context2.next = 12;
-	                return this._verifyDecryptionResult(result, txn);
-	              case 12:
-	                return _context2.abrupt("return", result);
+	                validEvents.push(event);
+	              case 11:
+	                _context2.next = 5;
+	                break;
 	              case 13:
+	                _context2.next = 18;
+	                break;
+	              case 15:
+	                _context2.prev = 15;
+	                _context2.t0 = _context2["catch"](3);
+	                _iterator2.e(_context2.t0);
+	              case 18:
+	                _context2.prev = 18;
+	                _iterator2.f();
+	                return _context2.finish(18);
+	              case 21:
+	                if (!(source === DecryptionSource.Sync)) {
+	                  _context2.next = 25;
+	                  break;
+	                }
+	                sessionCache = this._megolmSyncCache;
+	                _context2.next = 35;
+	                break;
+	              case 25:
+	                if (!(source === DecryptionSource.Timeline)) {
+	                  _context2.next = 29;
+	                  break;
+	                }
+	                sessionCache = this._megolmBackfillCache;
+	                _context2.next = 35;
+	                break;
+	              case 29:
+	                if (!(source === DecryptionSource.Retry)) {
+	                  _context2.next = 34;
+	                  break;
+	                }
+	                customCache = this._megolmEncryption.createSessionCache();
+	                sessionCache = customCache;
+	                _context2.next = 35;
+	                break;
+	              case 34:
+	                throw new Error("Unknown source: " + source);
+	              case 35:
+	                _context2.next = 37;
+	                return this._megolmDecryption.prepareDecryptAll(this._room.id, validEvents, sessionCache, txn);
+	              case 37:
+	                preparation = _context2.sent;
+	                if (customCache) {
+	                  customCache.dispose();
+	                }
+	                return _context2.abrupt("return", new DecryptionPreparation$1(preparation, errors, {
+	                  isTimelineOpen: isTimelineOpen
+	                }, this));
+	              case 40:
 	              case "end":
 	                return _context2.stop();
 	            }
 	          }
-	        }, _callee2, this);
+	        }, _callee2, this, [[3, 15, 18, 21]]);
 	      }));
-	      function decrypt(_x3, _x4, _x5, _x6, _x7) {
-	        return _decrypt.apply(this, arguments);
+	      function prepareDecryptAll(_x3, _x4, _x5, _x6) {
+	        return _prepareDecryptAll.apply(this, arguments);
 	      }
-	      return decrypt;
+	      return prepareDecryptAll;
 	    }()
 	  }, {
-	    key: "_verifyDecryptionResult",
+	    key: "_processDecryptionResults",
 	    value: function () {
-	      var _verifyDecryptionResult2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee3(result, txn) {
-	        var device;
+	      var _processDecryptionResults2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee3(results, errors, flags, txn) {
+	        var _iterator3, _step3, error, _iterator4, _step4, result;
 	        return regeneratorRuntime.wrap(function _callee3$(_context3) {
 	          while (1) {
 	            switch (_context3.prev = _context3.next) {
 	              case 0:
-	                device = this._senderDeviceCache.get(result.senderCurve25519Key);
-	                if (device) {
-	                  _context3.next = 6;
+	                _iterator3 = _createForOfIteratorHelper(errors.values());
+	                try {
+	                  for (_iterator3.s(); !(_step3 = _iterator3.n()).done;) {
+	                    error = _step3.value;
+	                    if (error.code === "MEGOLM_NO_SESSION") {
+	                      this._addMissingSessionEvent(error.event);
+	                    }
+	                  }
+	                } catch (err) {
+	                  _iterator3.e(err);
+	                } finally {
+	                  _iterator3.f();
+	                }
+	                if (!flags.isTimelineOpen) {
+	                  _context3.next = 20;
 	                  break;
 	                }
-	                _context3.next = 4;
+	                _iterator4 = _createForOfIteratorHelper(results.values());
+	                _context3.prev = 4;
+	                _iterator4.s();
+	              case 6:
+	                if ((_step4 = _iterator4.n()).done) {
+	                  _context3.next = 12;
+	                  break;
+	                }
+	                result = _step4.value;
+	                _context3.next = 10;
+	                return this._verifyDecryptionResult(result, txn);
+	              case 10:
+	                _context3.next = 6;
+	                break;
+	              case 12:
+	                _context3.next = 17;
+	                break;
+	              case 14:
+	                _context3.prev = 14;
+	                _context3.t0 = _context3["catch"](4);
+	                _iterator4.e(_context3.t0);
+	              case 17:
+	                _context3.prev = 17;
+	                _iterator4.f();
+	                return _context3.finish(17);
+	              case 20:
+	              case "end":
+	                return _context3.stop();
+	            }
+	          }
+	        }, _callee3, this, [[4, 14, 17, 20]]);
+	      }));
+	      function _processDecryptionResults(_x7, _x8, _x9, _x10) {
+	        return _processDecryptionResults2.apply(this, arguments);
+	      }
+	      return _processDecryptionResults;
+	    }()
+	  }, {
+	    key: "_verifyDecryptionResult",
+	    value: function () {
+	      var _verifyDecryptionResult2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee4(result, txn) {
+	        var device;
+	        return regeneratorRuntime.wrap(function _callee4$(_context4) {
+	          while (1) {
+	            switch (_context4.prev = _context4.next) {
+	              case 0:
+	                device = this._senderDeviceCache.get(result.senderCurve25519Key);
+	                if (device) {
+	                  _context4.next = 6;
+	                  break;
+	                }
+	                _context4.next = 4;
 	                return this._deviceTracker.getDeviceByCurve25519Key(result.senderCurve25519Key, txn);
 	              case 4:
-	                device = _context3.sent;
+	                device = _context4.sent;
 	                this._senderDeviceCache.set(result.senderCurve25519Key, device);
 	              case 6:
 	                if (device) {
@@ -17050,101 +17777,98 @@ var hydrogenBundle = (function (exports) {
 	                }
 	              case 7:
 	              case "end":
-	                return _context3.stop();
+	                return _context4.stop();
 	            }
 	          }
-	        }, _callee3, this);
+	        }, _callee4, this);
 	      }));
-	      function _verifyDecryptionResult(_x8, _x9) {
+	      function _verifyDecryptionResult(_x11, _x12) {
 	        return _verifyDecryptionResult2.apply(this, arguments);
 	      }
 	      return _verifyDecryptionResult;
 	    }()
 	  }, {
 	    key: "_addMissingSessionEvent",
-	    value: function _addMissingSessionEvent(event, isSync, data) {
+	    value: function _addMissingSessionEvent(event) {
 	      var _event$content3, _event$content4;
 	      var senderKey = (_event$content3 = event.content) === null || _event$content3 === void 0 ? void 0 : _event$content3["sender_key"];
 	      var sessionId = (_event$content4 = event.content) === null || _event$content4 === void 0 ? void 0 : _event$content4["session_id"];
 	      var key = "".concat(senderKey, "|").concat(sessionId);
 	      var eventIds = this._eventIdsByMissingSession.get(key);
 	      if (!eventIds) {
-	        eventIds = new Map();
+	        eventIds = new Set();
 	        this._eventIdsByMissingSession.set(key, eventIds);
 	      }
-	      eventIds.set(event.event_id, {
-	        data: data,
-	        isSync: isSync
-	      });
+	      eventIds.add(event.event_id);
 	    }
 	  }, {
 	    key: "applyRoomKeys",
 	    value: function applyRoomKeys(roomKeys) {
-	      var retryEntries = [];
-	      var _iterator2 = _createForOfIteratorHelper(roomKeys),
-	          _step2;
+	      var retryEventIds = [];
+	      var _iterator5 = _createForOfIteratorHelper(roomKeys),
+	          _step5;
 	      try {
-	        for (_iterator2.s(); !(_step2 = _iterator2.n()).done;) {
-	          var roomKey = _step2.value;
+	        for (_iterator5.s(); !(_step5 = _iterator5.n()).done;) {
+	          var roomKey = _step5.value;
 	          var key = "".concat(roomKey.senderKey, "|").concat(roomKey.sessionId);
 	          var entriesForSession = this._eventIdsByMissingSession.get(key);
 	          if (entriesForSession) {
 	            this._eventIdsByMissingSession.delete(key);
-	            retryEntries.push.apply(retryEntries, _toConsumableArray(entriesForSession.values()));
+	            retryEventIds.push.apply(retryEventIds, _toConsumableArray(entriesForSession));
 	          }
 	        }
 	      } catch (err) {
-	        _iterator2.e(err);
+	        _iterator5.e(err);
 	      } finally {
-	        _iterator2.f();
+	        _iterator5.f();
 	      }
-	      return retryEntries;
+	      return retryEventIds;
 	    }
 	  }, {
 	    key: "encrypt",
 	    value: function () {
-	      var _encrypt = _asyncToGenerator( regeneratorRuntime.mark(function _callee4(type, content, hsApi) {
+	      var _encrypt = _asyncToGenerator( regeneratorRuntime.mark(function _callee5(type, content, hsApi) {
 	        var megolmResult, devices, userIds;
-	        return regeneratorRuntime.wrap(function _callee4$(_context4) {
+	        return regeneratorRuntime.wrap(function _callee5$(_context5) {
 	          while (1) {
-	            switch (_context4.prev = _context4.next) {
+	            switch (_context5.prev = _context5.next) {
 	              case 0:
-	                _context4.next = 2;
+	                _context5.next = 2;
 	                return this._megolmEncryption.encrypt(this._room.id, type, content, this._encryptionParams);
 	              case 2:
-	                megolmResult = _context4.sent;
+	                megolmResult = _context5.sent;
 	                if (!megolmResult.roomKeyMessage) {
-	                  _context4.next = 14;
+	                  _context5.next = 14;
 	                  break;
 	                }
-	                _context4.next = 6;
+	                _context5.next = 6;
 	                return this._deviceTracker.trackRoom(this._room);
 	              case 6:
-	                _context4.next = 8;
+	                _context5.next = 8;
 	                return this._deviceTracker.devicesForTrackedRoom(this._room.id, hsApi);
 	              case 8:
-	                devices = _context4.sent;
-	                _context4.next = 11;
+	                devices = _context5.sent;
+	                _context5.next = 11;
 	                return this._sendRoomKey(megolmResult.roomKeyMessage, devices, hsApi);
 	              case 11:
 	                userIds = Array.from(devices.reduce(function (set, device) {
 	                  return set.add(device.userId);
 	                }, new Set()));
-	                _context4.next = 14;
+	                _context5.next = 14;
 	                return this._clearNeedsRoomKeyFlag(userIds);
 	              case 14:
-	                return _context4.abrupt("return", {
+	                return _context5.abrupt("return", {
 	                  type: ENCRYPTED_TYPE,
 	                  content: megolmResult.content
 	                });
 	              case 15:
 	              case "end":
-	                return _context4.stop();
+	                return _context5.stop();
 	            }
 	          }
-	        }, _callee4, this);
+	        }, _callee5, this);
 	      }));
-	      function encrypt(_x10, _x11, _x12) {
+	      function encrypt(_x13, _x14, _x15) {
 	        return _encrypt.apply(this, arguments);
 	      }
 	      return encrypt;
@@ -17152,51 +17876,51 @@ var hydrogenBundle = (function (exports) {
 	  }, {
 	    key: "needsToShareKeys",
 	    value: function needsToShareKeys(memberChanges) {
-	      var _iterator3 = _createForOfIteratorHelper(memberChanges.values()),
-	          _step3;
+	      var _iterator6 = _createForOfIteratorHelper(memberChanges.values()),
+	          _step6;
 	      try {
-	        for (_iterator3.s(); !(_step3 = _iterator3.n()).done;) {
-	          var m = _step3.value;
+	        for (_iterator6.s(); !(_step6 = _iterator6.n()).done;) {
+	          var m = _step6.value;
 	          if (m.member.needsRoomKey) {
 	            return true;
 	          }
 	        }
 	      } catch (err) {
-	        _iterator3.e(err);
+	        _iterator6.e(err);
 	      } finally {
-	        _iterator3.f();
+	        _iterator6.f();
 	      }
 	      return false;
 	    }
 	  }, {
 	    key: "shareRoomKeyToPendingMembers",
 	    value: function () {
-	      var _shareRoomKeyToPendingMembers = _asyncToGenerator( regeneratorRuntime.mark(function _callee5(hsApi) {
+	      var _shareRoomKeyToPendingMembers = _asyncToGenerator( regeneratorRuntime.mark(function _callee6(hsApi) {
 	        var txn, pendingUserIds;
-	        return regeneratorRuntime.wrap(function _callee5$(_context5) {
+	        return regeneratorRuntime.wrap(function _callee6$(_context6) {
 	          while (1) {
-	            switch (_context5.prev = _context5.next) {
+	            switch (_context6.prev = _context6.next) {
 	              case 0:
-	                _context5.next = 2;
+	                _context6.next = 2;
 	                return this._storage.readTxn([this._storage.storeNames.roomMembers]);
 	              case 2:
-	                txn = _context5.sent;
-	                _context5.next = 5;
+	                txn = _context6.sent;
+	                _context6.next = 5;
 	                return txn.roomMembers.getUserIdsNeedingRoomKey(this._room.id);
 	              case 5:
-	                pendingUserIds = _context5.sent;
-	                _context5.next = 8;
+	                pendingUserIds = _context6.sent;
+	                _context6.next = 8;
 	                return this._shareRoomKey(pendingUserIds, hsApi);
 	              case 8:
-	                return _context5.abrupt("return", _context5.sent);
+	                return _context6.abrupt("return", _context6.sent);
 	              case 9:
 	              case "end":
-	                return _context5.stop();
+	                return _context6.stop();
 	            }
 	          }
-	        }, _callee5, this);
+	        }, _callee6, this);
 	      }));
-	      function shareRoomKeyToPendingMembers(_x13) {
+	      function shareRoomKeyToPendingMembers(_x16) {
 	        return _shareRoomKeyToPendingMembers.apply(this, arguments);
 	      }
 	      return shareRoomKeyToPendingMembers;
@@ -17204,38 +17928,38 @@ var hydrogenBundle = (function (exports) {
 	  }, {
 	    key: "shareRoomKeyForMemberChanges",
 	    value: function () {
-	      var _shareRoomKeyForMemberChanges = _asyncToGenerator( regeneratorRuntime.mark(function _callee6(memberChanges, hsApi) {
-	        var pendingUserIds, _iterator4, _step4, m;
-	        return regeneratorRuntime.wrap(function _callee6$(_context6) {
+	      var _shareRoomKeyForMemberChanges = _asyncToGenerator( regeneratorRuntime.mark(function _callee7(memberChanges, hsApi) {
+	        var pendingUserIds, _iterator7, _step7, m;
+	        return regeneratorRuntime.wrap(function _callee7$(_context7) {
 	          while (1) {
-	            switch (_context6.prev = _context6.next) {
+	            switch (_context7.prev = _context7.next) {
 	              case 0:
 	                pendingUserIds = [];
-	                _iterator4 = _createForOfIteratorHelper(memberChanges.values());
+	                _iterator7 = _createForOfIteratorHelper(memberChanges.values());
 	                try {
-	                  for (_iterator4.s(); !(_step4 = _iterator4.n()).done;) {
-	                    m = _step4.value;
+	                  for (_iterator7.s(); !(_step7 = _iterator7.n()).done;) {
+	                    m = _step7.value;
 	                    if (m.member.needsRoomKey) {
 	                      pendingUserIds.push(m.userId);
 	                    }
 	                  }
 	                } catch (err) {
-	                  _iterator4.e(err);
+	                  _iterator7.e(err);
 	                } finally {
-	                  _iterator4.f();
+	                  _iterator7.f();
 	                }
-	                _context6.next = 5;
+	                _context7.next = 5;
 	                return this._shareRoomKey(pendingUserIds, hsApi);
 	              case 5:
-	                return _context6.abrupt("return", _context6.sent);
+	                return _context7.abrupt("return", _context7.sent);
 	              case 6:
 	              case "end":
-	                return _context6.stop();
+	                return _context7.stop();
 	            }
 	          }
-	        }, _callee6, this);
+	        }, _callee7, this);
 	      }));
-	      function shareRoomKeyForMemberChanges(_x14, _x15) {
+	      function shareRoomKeyForMemberChanges(_x17, _x18) {
 	        return _shareRoomKeyForMemberChanges.apply(this, arguments);
 	      }
 	      return shareRoomKeyForMemberChanges;
@@ -17243,56 +17967,56 @@ var hydrogenBundle = (function (exports) {
 	  }, {
 	    key: "_shareRoomKey",
 	    value: function () {
-	      var _shareRoomKey2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee7(userIds, hsApi) {
+	      var _shareRoomKey2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee8(userIds, hsApi) {
 	        var readRoomKeyTxn, roomKeyMessage, devices, actuallySentUserIds;
-	        return regeneratorRuntime.wrap(function _callee7$(_context7) {
+	        return regeneratorRuntime.wrap(function _callee8$(_context8) {
 	          while (1) {
-	            switch (_context7.prev = _context7.next) {
+	            switch (_context8.prev = _context8.next) {
 	              case 0:
 	                if (!(userIds.length === 0)) {
-	                  _context7.next = 2;
+	                  _context8.next = 2;
 	                  break;
 	                }
-	                return _context7.abrupt("return");
+	                return _context8.abrupt("return");
 	              case 2:
-	                _context7.next = 4;
+	                _context8.next = 4;
 	                return this._storage.readTxn([this._storage.storeNames.outboundGroupSessions]);
 	              case 4:
-	                readRoomKeyTxn = _context7.sent;
-	                _context7.next = 7;
+	                readRoomKeyTxn = _context8.sent;
+	                _context8.next = 7;
 	                return this._megolmEncryption.createRoomKeyMessage(this._room.id, readRoomKeyTxn);
 	              case 7:
-	                roomKeyMessage = _context7.sent;
+	                roomKeyMessage = _context8.sent;
 	                if (!roomKeyMessage) {
-	                  _context7.next = 19;
+	                  _context8.next = 19;
 	                  break;
 	                }
-	                _context7.next = 11;
+	                _context8.next = 11;
 	                return this._deviceTracker.devicesForRoomMembers(this._room.id, userIds, hsApi);
 	              case 11:
-	                devices = _context7.sent;
-	                _context7.next = 14;
+	                devices = _context8.sent;
+	                _context8.next = 14;
 	                return this._sendRoomKey(roomKeyMessage, devices, hsApi);
 	              case 14:
 	                actuallySentUserIds = Array.from(devices.reduce(function (set, device) {
 	                  return set.add(device.userId);
 	                }, new Set()));
-	                _context7.next = 17;
+	                _context8.next = 17;
 	                return this._clearNeedsRoomKeyFlag(actuallySentUserIds);
 	              case 17:
-	                _context7.next = 21;
+	                _context8.next = 21;
 	                break;
 	              case 19:
-	                _context7.next = 21;
+	                _context8.next = 21;
 	                return this._clearNeedsRoomKeyFlag(userIds);
 	              case 21:
 	              case "end":
-	                return _context7.stop();
+	                return _context8.stop();
 	            }
 	          }
-	        }, _callee7, this);
+	        }, _callee8, this);
 	      }));
-	      function _shareRoomKey(_x16, _x17) {
+	      function _shareRoomKey(_x19, _x20) {
 	        return _shareRoomKey2.apply(this, arguments);
 	      }
 	      return _shareRoomKey;
@@ -17300,64 +18024,64 @@ var hydrogenBundle = (function (exports) {
 	  }, {
 	    key: "_clearNeedsRoomKeyFlag",
 	    value: function () {
-	      var _clearNeedsRoomKeyFlag2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee9(userIds) {
+	      var _clearNeedsRoomKeyFlag2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee10(userIds) {
 	        var _this = this;
 	        var txn;
-	        return regeneratorRuntime.wrap(function _callee9$(_context9) {
+	        return regeneratorRuntime.wrap(function _callee10$(_context10) {
 	          while (1) {
-	            switch (_context9.prev = _context9.next) {
+	            switch (_context10.prev = _context10.next) {
 	              case 0:
-	                _context9.next = 2;
+	                _context10.next = 2;
 	                return this._storage.readWriteTxn([this._storage.storeNames.roomMembers]);
 	              case 2:
-	                txn = _context9.sent;
-	                _context9.prev = 3;
-	                _context9.next = 6;
+	                txn = _context10.sent;
+	                _context10.prev = 3;
+	                _context10.next = 6;
 	                return Promise.all(userIds.map( function () {
-	                  var _ref2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee8(userId) {
+	                  var _ref2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee9(userId) {
 	                    var memberData;
-	                    return regeneratorRuntime.wrap(function _callee8$(_context8) {
+	                    return regeneratorRuntime.wrap(function _callee9$(_context9) {
 	                      while (1) {
-	                        switch (_context8.prev = _context8.next) {
+	                        switch (_context9.prev = _context9.next) {
 	                          case 0:
-	                            _context8.next = 2;
+	                            _context9.next = 2;
 	                            return txn.roomMembers.get(_this._room.id, userId);
 	                          case 2:
-	                            memberData = _context8.sent;
+	                            memberData = _context9.sent;
 	                            if (memberData.needsRoomKey) {
 	                              memberData.needsRoomKey = false;
 	                              txn.roomMembers.set(memberData);
 	                            }
 	                          case 4:
 	                          case "end":
-	                            return _context8.stop();
+	                            return _context9.stop();
 	                        }
 	                      }
-	                    }, _callee8);
+	                    }, _callee9);
 	                  }));
-	                  return function (_x19) {
+	                  return function (_x22) {
 	                    return _ref2.apply(this, arguments);
 	                  };
 	                }()));
 	              case 6:
-	                _context9.next = 12;
+	                _context10.next = 12;
 	                break;
 	              case 8:
-	                _context9.prev = 8;
-	                _context9.t0 = _context9["catch"](3);
+	                _context10.prev = 8;
+	                _context10.t0 = _context10["catch"](3);
 	                txn.abort();
-	                throw _context9.t0;
+	                throw _context10.t0;
 	              case 12:
-	                _context9.next = 14;
+	                _context10.next = 14;
 	                return txn.complete();
 	              case 14:
 	              case "end":
-	                return _context9.stop();
+	                return _context10.stop();
 	            }
 	          }
-	        }, _callee9, this, [[3, 8]]);
+	        }, _callee10, this, [[3, 8]]);
 	      }));
-	      function _clearNeedsRoomKeyFlag(_x18) {
+	      function _clearNeedsRoomKeyFlag(_x21) {
 	        return _clearNeedsRoomKeyFlag2.apply(this, arguments);
 	      }
 	      return _clearNeedsRoomKeyFlag;
@@ -17365,26 +18089,26 @@ var hydrogenBundle = (function (exports) {
 	  }, {
 	    key: "_sendRoomKey",
 	    value: function () {
-	      var _sendRoomKey2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee10(roomKeyMessage, devices, hsApi) {
+	      var _sendRoomKey2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee11(roomKeyMessage, devices, hsApi) {
 	        var messages;
-	        return regeneratorRuntime.wrap(function _callee10$(_context10) {
+	        return regeneratorRuntime.wrap(function _callee11$(_context11) {
 	          while (1) {
-	            switch (_context10.prev = _context10.next) {
+	            switch (_context11.prev = _context11.next) {
 	              case 0:
-	                _context10.next = 2;
+	                _context11.next = 2;
 	                return this._olmEncryption.encrypt("m.room_key", roomKeyMessage, devices, hsApi);
 	              case 2:
-	                messages = _context10.sent;
-	                _context10.next = 5;
+	                messages = _context11.sent;
+	                _context11.next = 5;
 	                return this._sendMessagesToDevices(ENCRYPTED_TYPE, messages, hsApi);
 	              case 5:
 	              case "end":
-	                return _context10.stop();
+	                return _context11.stop();
 	            }
 	          }
-	        }, _callee10, this);
+	        }, _callee11, this);
 	      }));
-	      function _sendRoomKey(_x20, _x21, _x22) {
+	      function _sendRoomKey(_x23, _x24, _x25) {
 	        return _sendRoomKey2.apply(this, arguments);
 	      }
 	      return _sendRoomKey;
@@ -17392,11 +18116,11 @@ var hydrogenBundle = (function (exports) {
 	  }, {
 	    key: "_sendMessagesToDevices",
 	    value: function () {
-	      var _sendMessagesToDevices2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee11(type, messages, hsApi) {
+	      var _sendMessagesToDevices2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee12(type, messages, hsApi) {
 	        var messagesByUser, payload, txnId;
-	        return regeneratorRuntime.wrap(function _callee11$(_context11) {
+	        return regeneratorRuntime.wrap(function _callee12$(_context12) {
 	          while (1) {
-	            switch (_context11.prev = _context11.next) {
+	            switch (_context12.prev = _context12.next) {
 	              case 0:
 	                messagesByUser = groupBy(messages, function (message) {
 	                  return message.device.userId;
@@ -17414,22 +18138,143 @@ var hydrogenBundle = (function (exports) {
 	                  }, {})
 	                };
 	                txnId = makeTxnId();
-	                _context11.next = 5;
+	                _context12.next = 5;
 	                return hsApi.sendToDevice(type, payload, txnId).response();
 	              case 5:
 	              case "end":
-	                return _context11.stop();
+	                return _context12.stop();
 	            }
 	          }
-	        }, _callee11);
+	        }, _callee12);
 	      }));
-	      function _sendMessagesToDevices(_x23, _x24, _x25) {
+	      function _sendMessagesToDevices(_x26, _x27, _x28) {
 	        return _sendMessagesToDevices2.apply(this, arguments);
 	      }
 	      return _sendMessagesToDevices;
 	    }()
 	  }]);
 	  return RoomEncryption;
+	}();
+	var DecryptionPreparation$1 = function () {
+	  function DecryptionPreparation(megolmDecryptionPreparation, extraErrors, flags, roomEncryption) {
+	    _classCallCheck(this, DecryptionPreparation);
+	    this._megolmDecryptionPreparation = megolmDecryptionPreparation;
+	    this._extraErrors = extraErrors;
+	    this._flags = flags;
+	    this._roomEncryption = roomEncryption;
+	  }
+	  _createClass(DecryptionPreparation, [{
+	    key: "decrypt",
+	    value: function () {
+	      var _decrypt = _asyncToGenerator( regeneratorRuntime.mark(function _callee13() {
+	        return regeneratorRuntime.wrap(function _callee13$(_context13) {
+	          while (1) {
+	            switch (_context13.prev = _context13.next) {
+	              case 0:
+	                _context13.t0 = DecryptionChanges$2;
+	                _context13.next = 3;
+	                return this._megolmDecryptionPreparation.decrypt();
+	              case 3:
+	                _context13.t1 = _context13.sent;
+	                _context13.t2 = this._extraErrors;
+	                _context13.t3 = this._flags;
+	                _context13.t4 = this._roomEncryption;
+	                return _context13.abrupt("return", new _context13.t0(_context13.t1, _context13.t2, _context13.t3, _context13.t4));
+	              case 8:
+	              case "end":
+	                return _context13.stop();
+	            }
+	          }
+	        }, _callee13, this);
+	      }));
+	      function decrypt() {
+	        return _decrypt.apply(this, arguments);
+	      }
+	      return decrypt;
+	    }()
+	  }, {
+	    key: "dispose",
+	    value: function dispose() {
+	      this._megolmDecryptionPreparation.dispose();
+	    }
+	  }]);
+	  return DecryptionPreparation;
+	}();
+	var DecryptionChanges$2 = function () {
+	  function DecryptionChanges(megolmDecryptionChanges, extraErrors, flags, roomEncryption) {
+	    _classCallCheck(this, DecryptionChanges);
+	    this._megolmDecryptionChanges = megolmDecryptionChanges;
+	    this._extraErrors = extraErrors;
+	    this._flags = flags;
+	    this._roomEncryption = roomEncryption;
+	  }
+	  _createClass(DecryptionChanges, [{
+	    key: "write",
+	    value: function () {
+	      var _write = _asyncToGenerator( regeneratorRuntime.mark(function _callee14(txn) {
+	        var _yield$this$_megolmDe, results, errors;
+	        return regeneratorRuntime.wrap(function _callee14$(_context14) {
+	          while (1) {
+	            switch (_context14.prev = _context14.next) {
+	              case 0:
+	                _context14.next = 2;
+	                return this._megolmDecryptionChanges.write(txn);
+	              case 2:
+	                _yield$this$_megolmDe = _context14.sent;
+	                results = _yield$this$_megolmDe.results;
+	                errors = _yield$this$_megolmDe.errors;
+	                mergeMap(this._extraErrors, errors);
+	                _context14.next = 8;
+	                return this._roomEncryption._processDecryptionResults(results, errors, this._flags, txn);
+	              case 8:
+	                return _context14.abrupt("return", new BatchDecryptionResult(results, errors));
+	              case 9:
+	              case "end":
+	                return _context14.stop();
+	            }
+	          }
+	        }, _callee14, this);
+	      }));
+	      function write(_x29) {
+	        return _write.apply(this, arguments);
+	      }
+	      return write;
+	    }()
+	  }]);
+	  return DecryptionChanges;
+	}();
+	var BatchDecryptionResult = function () {
+	  function BatchDecryptionResult(results, errors) {
+	    _classCallCheck(this, BatchDecryptionResult);
+	    this.results = results;
+	    this.errors = errors;
+	  }
+	  _createClass(BatchDecryptionResult, [{
+	    key: "applyToEntries",
+	    value: function applyToEntries(entries) {
+	      var _iterator8 = _createForOfIteratorHelper(entries),
+	          _step8;
+	      try {
+	        for (_iterator8.s(); !(_step8 = _iterator8.n()).done;) {
+	          var entry = _step8.value;
+	          var result = this.results.get(entry.id);
+	          if (result) {
+	            entry.setDecryptionResult(result);
+	          } else {
+	            var error = this.errors.get(entry.id);
+	            if (error) {
+	              entry.setDecryptionError(error);
+	            }
+	          }
+	        }
+	      } catch (err) {
+	        _iterator8.e(err);
+	      } finally {
+	        _iterator8.f();
+	      }
+	    }
+	  }]);
+	  return BatchDecryptionResult;
 	}();
 
 	var TRACKING_STATUS_OUTDATED = 0;
@@ -18183,7 +19028,8 @@ var hydrogenBundle = (function (exports) {
 	        storage = _ref.storage,
 	        hsApi = _ref.hsApi,
 	        sessionInfo = _ref.sessionInfo,
-	        olm = _ref.olm;
+	        olm = _ref.olm,
+	        workerPool = _ref.workerPool;
 	    _classCallCheck(this, Session);
 	    this._clock = clock;
 	    this._storage = storage;
@@ -18212,6 +19058,7 @@ var hydrogenBundle = (function (exports) {
 	    this._getSyncToken = function () {
 	      return _this.syncToken;
 	    };
+	    this._workerPool = workerPool;
 	    if (olm) {
 	      this._olmUtil = new olm.Utility();
 	      this._deviceTracker = new DeviceTracker({
@@ -18258,7 +19105,8 @@ var hydrogenBundle = (function (exports) {
 	      });
 	      this._megolmDecryption = new Decryption$1({
 	        pickleKey: PICKLE_KEY,
-	        olm: this._olm
+	        olm: this._olm,
+	        workerPool: this._workerPool
 	      });
 	      this._deviceMessageHandler.enableEncryption({
 	        olmDecryption: olmDecryption,
@@ -18421,6 +19269,8 @@ var hydrogenBundle = (function (exports) {
 	  }, {
 	    key: "stop",
 	    value: function stop() {
+	      var _this$_workerPool;
+	      (_this$_workerPool = this._workerPool) === null || _this$_workerPool === void 0 ? void 0 : _this$_workerPool.dispose();
 	      this._sendScheduler.stop();
 	    }
 	  }, {
@@ -18522,7 +19372,7 @@ var hydrogenBundle = (function (exports) {
 	  }, {
 	    key: "writeSync",
 	    value: function () {
-	      var _writeSync = _asyncToGenerator( regeneratorRuntime.mark(function _callee5(syncResponse, syncFilterId, roomChanges, txn) {
+	      var _writeSync = _asyncToGenerator( regeneratorRuntime.mark(function _callee5(syncResponse, syncFilterId, txn) {
 	        var _syncResponse$to_devi;
 	        var changes, syncToken, deviceOneTimeKeysCount, syncInfo, deviceLists, toDeviceEvents;
 	        return regeneratorRuntime.wrap(function _callee5$(_context5) {
@@ -18567,7 +19417,7 @@ var hydrogenBundle = (function (exports) {
 	          }
 	        }, _callee5, this);
 	      }));
-	      function writeSync(_x4, _x5, _x6, _x7) {
+	      function writeSync(_x4, _x5, _x6) {
 	        return _writeSync.apply(this, arguments);
 	      }
 	      return writeSync;
@@ -18658,7 +19508,8 @@ var hydrogenBundle = (function (exports) {
 	        request = _ref.request,
 	        storageFactory = _ref.storageFactory,
 	        sessionInfoStorage = _ref.sessionInfoStorage,
-	        olmPromise = _ref.olmPromise;
+	        olmPromise = _ref.olmPromise,
+	        workerPromise = _ref.workerPromise;
 	    _classCallCheck(this, SessionContainer);
 	    this._random = random;
 	    this._clock = clock;
@@ -18675,6 +19526,7 @@ var hydrogenBundle = (function (exports) {
 	    this._sessionId = null;
 	    this._storage = null;
 	    this._olmPromise = olmPromise;
+	    this._workerPromise = workerPromise;
 	  }
 	  _createClass(SessionContainer, [{
 	    key: "createNewSessionId",
@@ -18817,7 +19669,7 @@ var hydrogenBundle = (function (exports) {
 	    value: function () {
 	      var _loadSessionInfo2 = _asyncToGenerator( regeneratorRuntime.mark(function _callee3(sessionInfo, isNewLogin) {
 	        var _this = this;
-	        var hsApi, filteredSessionInfo, olm, lastVersionsResponse;
+	        var hsApi, filteredSessionInfo, olm, workerPool, lastVersionsResponse;
 	        return regeneratorRuntime.wrap(function _callee3$(_context3) {
 	          while (1) {
 	            switch (_context3.prev = _context3.next) {
@@ -18849,20 +19701,31 @@ var hydrogenBundle = (function (exports) {
 	                return this._olmPromise;
 	              case 10:
 	                olm = _context3.sent;
+	                workerPool = null;
+	                if (!this._workerPromise) {
+	                  _context3.next = 16;
+	                  break;
+	                }
+	                _context3.next = 15;
+	                return this._workerPromise;
+	              case 15:
+	                workerPool = _context3.sent;
+	              case 16:
 	                this._session = new Session$1({
 	                  storage: this._storage,
 	                  sessionInfo: filteredSessionInfo,
 	                  hsApi: hsApi,
 	                  olm: olm,
-	                  clock: this._clock
+	                  clock: this._clock,
+	                  workerPool: workerPool
 	                });
-	                _context3.next = 14;
+	                _context3.next = 19;
 	                return this._session.load();
-	              case 14:
+	              case 19:
 	                this._status.set(LoadStatus.SessionSetup);
-	                _context3.next = 17;
+	                _context3.next = 22;
 	                return this._session.beforeFirstSync(isNewLogin);
-	              case 17:
+	              case 22:
 	                this._sync = new Sync({
 	                  hsApi: hsApi,
 	                  storage: this._storage,
@@ -18874,22 +19737,22 @@ var hydrogenBundle = (function (exports) {
 	                    _this._session.start(_this._reconnector.lastVersionsResponse);
 	                  }
 	                });
-	                _context3.next = 21;
+	                _context3.next = 26;
 	                return this._waitForFirstSync();
-	              case 21:
+	              case 26:
 	                this._status.set(LoadStatus.Ready);
 	                if (!this._session.isStarted) {
-	                  _context3.next = 27;
+	                  _context3.next = 32;
 	                  break;
 	                }
-	                _context3.next = 25;
+	                _context3.next = 30;
 	                return hsApi.versions({
 	                  timeout: 10000
 	                }).response();
-	              case 25:
+	              case 30:
 	                lastVersionsResponse = _context3.sent;
 	                this._session.start(lastVersionsResponse);
-	              case 27:
+	              case 32:
 	              case "end":
 	                return _context3.stop();
 	            }
@@ -21474,63 +22337,6 @@ var hydrogenBundle = (function (exports) {
 	  return hashCode(id) % 8 + 1;
 	}
 
-	function disposeValue(value) {
-	  if (typeof value === "function") {
-	    value();
-	  } else {
-	    value.dispose();
-	  }
-	}
-	var Disposables = function () {
-	  function Disposables() {
-	    _classCallCheck(this, Disposables);
-	    this._disposables = [];
-	  }
-	  _createClass(Disposables, [{
-	    key: "track",
-	    value: function track(disposable) {
-	      this._disposables.push(disposable);
-	    }
-	  }, {
-	    key: "dispose",
-	    value: function dispose() {
-	      if (this._disposables) {
-	        var _iterator = _createForOfIteratorHelper(this._disposables),
-	            _step;
-	        try {
-	          for (_iterator.s(); !(_step = _iterator.n()).done;) {
-	            var d = _step.value;
-	            disposeValue(d);
-	          }
-	        } catch (err) {
-	          _iterator.e(err);
-	        } finally {
-	          _iterator.f();
-	        }
-	        this._disposables = null;
-	      }
-	    }
-	  }, {
-	    key: "disposeTracked",
-	    value: function disposeTracked(value) {
-	      if (value === undefined || value === null) {
-	        return null;
-	      }
-	      var idx = this._disposables.indexOf(value);
-	      if (idx !== -1) {
-	        var _this$_disposables$sp = this._disposables.splice(idx, 1),
-	            _this$_disposables$sp2 = _slicedToArray(_this$_disposables$sp, 1),
-	            foundValue = _this$_disposables$sp2[0];
-	        disposeValue(foundValue);
-	      } else {
-	        console.warn("disposable not found, did it leak?", value);
-	      }
-	      return null;
-	    }
-	  }]);
-	  return Disposables;
-	}();
-
 	var ViewModel = function (_EventEmitter) {
 	  _inherits(ViewModel, _EventEmitter);
 	  var _super = _createSuper(ViewModel);
@@ -21559,8 +22365,7 @@ var hydrogenBundle = (function (exports) {
 	      if (!this.disposables) {
 	        this.disposables = new Disposables();
 	      }
-	      this.disposables.track(disposable);
-	      return disposable;
+	      return this.disposables.track(disposable);
 	    }
 	  }, {
 	    key: "dispose",
@@ -22571,7 +23376,7 @@ var hydrogenBundle = (function (exports) {
 	                return _context.abrupt("return", firstTile.fill());
 	              case 5:
 	                _context.next = 7;
-	                return this._timeline.loadAtTop(50);
+	                return this._timeline.loadAtTop(10);
 	              case 7:
 	                return _context.abrupt("return", false);
 	              case 8:
@@ -22645,10 +23450,10 @@ var hydrogenBundle = (function (exports) {
 	              case 0:
 	                this._room.on("change", this._onRoomChange);
 	                _context.prev = 1;
-	                _context.next = 4;
-	                return this._room.openTimeline();
-	              case 4:
-	                this._timeline = _context.sent;
+	                this._timeline = this.track(this._room.openTimeline());
+	                _context.next = 5;
+	                return this._timeline.load();
+	              case 5:
 	                this._timelineVM = new TimelineViewModel(this.childOptions({
 	                  room: this._room,
 	                  timeline: this._timeline,
@@ -22697,9 +23502,7 @@ var hydrogenBundle = (function (exports) {
 	  }, {
 	    key: "dispose",
 	    value: function dispose() {
-	      if (this._timeline) {
-	        this._timeline.close();
-	      }
+	      _get(_getPrototypeOf(RoomViewModel.prototype), "dispose", this).call(this);
 	      if (this._clearUnreadTimout) {
 	        this._clearUnreadTimout.abort();
 	        this._clearUnreadTimout = null;
@@ -25987,6 +26790,255 @@ var hydrogenBundle = (function (exports) {
 	  return OnlineStatus;
 	}(BaseObservableValue);
 
+	var WorkerState = function () {
+	  function WorkerState(worker) {
+	    _classCallCheck(this, WorkerState);
+	    this.worker = worker;
+	    this.busy = false;
+	  }
+	  _createClass(WorkerState, [{
+	    key: "attach",
+	    value: function attach(pool) {
+	      this.worker.addEventListener("message", pool);
+	      this.worker.addEventListener("error", pool);
+	    }
+	  }, {
+	    key: "detach",
+	    value: function detach(pool) {
+	      this.worker.removeEventListener("message", pool);
+	      this.worker.removeEventListener("error", pool);
+	    }
+	  }]);
+	  return WorkerState;
+	}();
+	var Request = function () {
+	  function Request(message, pool) {
+	    var _this = this;
+	    _classCallCheck(this, Request);
+	    this._promise = new Promise(function (_resolve, _reject) {
+	      _this._resolve = _resolve;
+	      _this._reject = _reject;
+	    });
+	    this._message = message;
+	    this._pool = pool;
+	    this._worker = null;
+	  }
+	  _createClass(Request, [{
+	    key: "abort",
+	    value: function abort() {
+	      if (this._isNotDisposed) {
+	        this._pool._abortRequest(this);
+	        this._dispose();
+	      }
+	    }
+	  }, {
+	    key: "response",
+	    value: function response() {
+	      return this._promise;
+	    }
+	  }, {
+	    key: "_dispose",
+	    value: function _dispose() {
+	      this._reject = null;
+	      this._resolve = null;
+	    }
+	  }, {
+	    key: "_isNotDisposed",
+	    get: function get() {
+	      return this._resolve && this._reject;
+	    }
+	  }]);
+	  return Request;
+	}();
+	var WorkerPool = function () {
+	  function WorkerPool(path, amount) {
+	    _classCallCheck(this, WorkerPool);
+	    this._workers = [];
+	    for (var i = 0; i < amount; ++i) {
+	      var worker = new WorkerState(new Worker(path));
+	      worker.attach(this);
+	      this._workers[i] = worker;
+	    }
+	    this._requests = new Map();
+	    this._counter = 0;
+	    this._pendingFlag = false;
+	    this._init = null;
+	  }
+	  _createClass(WorkerPool, [{
+	    key: "init",
+	    value: function init() {
+	      var _this2 = this;
+	      var promise = new Promise(function (resolve, reject) {
+	        _this2._init = {
+	          resolve: resolve,
+	          reject: reject
+	        };
+	      });
+	      this.sendAll({
+	        type: "ping"
+	      }).then(this._init.resolve, this._init.reject).finally(function () {
+	        _this2._init = null;
+	      });
+	      return promise;
+	    }
+	  }, {
+	    key: "handleEvent",
+	    value: function handleEvent(e) {
+	      if (e.type === "message") {
+	        var message = e.data;
+	        var request = this._requests.get(message.replyToId);
+	        if (request) {
+	          request._worker.busy = false;
+	          if (request._isNotDisposed) {
+	            if (message.type === "success") {
+	              request._resolve(message.payload);
+	            } else if (message.type === "error") {
+	              request._reject(new Error(message.stack));
+	            }
+	            request._dispose();
+	          }
+	          this._requests.delete(message.replyToId);
+	        }
+	        this._sendPending();
+	      } else if (e.type === "error") {
+	        if (this._init) {
+	          this._init.reject(new Error("worker error during init"));
+	        }
+	        console.error("worker error", e);
+	      }
+	    }
+	  }, {
+	    key: "_getPendingRequest",
+	    value: function _getPendingRequest() {
+	      var _iterator = _createForOfIteratorHelper(this._requests.values()),
+	          _step;
+	      try {
+	        for (_iterator.s(); !(_step = _iterator.n()).done;) {
+	          var r = _step.value;
+	          if (!r._worker) {
+	            return r;
+	          }
+	        }
+	      } catch (err) {
+	        _iterator.e(err);
+	      } finally {
+	        _iterator.f();
+	      }
+	    }
+	  }, {
+	    key: "_getFreeWorker",
+	    value: function _getFreeWorker() {
+	      var _iterator2 = _createForOfIteratorHelper(this._workers),
+	          _step2;
+	      try {
+	        for (_iterator2.s(); !(_step2 = _iterator2.n()).done;) {
+	          var w = _step2.value;
+	          if (!w.busy) {
+	            return w;
+	          }
+	        }
+	      } catch (err) {
+	        _iterator2.e(err);
+	      } finally {
+	        _iterator2.f();
+	      }
+	    }
+	  }, {
+	    key: "_sendPending",
+	    value: function _sendPending() {
+	      this._pendingFlag = false;
+	      var success;
+	      do {
+	        success = false;
+	        var request = this._getPendingRequest();
+	        if (request) {
+	          var worker = this._getFreeWorker();
+	          if (worker) {
+	            this._sendWith(request, worker);
+	            success = true;
+	          }
+	        }
+	      } while (success);
+	    }
+	  }, {
+	    key: "_sendWith",
+	    value: function _sendWith(request, worker) {
+	      request._worker = worker;
+	      worker.busy = true;
+	      worker.worker.postMessage(request._message);
+	    }
+	  }, {
+	    key: "_enqueueRequest",
+	    value: function _enqueueRequest(message) {
+	      this._counter += 1;
+	      message.id = this._counter;
+	      var request = new Request(message, this);
+	      this._requests.set(message.id, request);
+	      return request;
+	    }
+	  }, {
+	    key: "send",
+	    value: function send(message) {
+	      var request = this._enqueueRequest(message);
+	      var worker = this._getFreeWorker();
+	      if (worker) {
+	        this._sendWith(request, worker);
+	      }
+	      return request;
+	    }
+	  }, {
+	    key: "sendAll",
+	    value: function sendAll(message) {
+	      var _this3 = this;
+	      var promises = this._workers.map(function (worker) {
+	        var request = _this3._enqueueRequest(Object.assign({}, message));
+	        _this3._sendWith(request, worker);
+	        return request.response();
+	      });
+	      return Promise.all(promises);
+	    }
+	  }, {
+	    key: "dispose",
+	    value: function dispose() {
+	      var _iterator3 = _createForOfIteratorHelper(this._workers),
+	          _step3;
+	      try {
+	        for (_iterator3.s(); !(_step3 = _iterator3.n()).done;) {
+	          var w = _step3.value;
+	          w.detach(this);
+	          w.worker.terminate();
+	        }
+	      } catch (err) {
+	        _iterator3.e(err);
+	      } finally {
+	        _iterator3.f();
+	      }
+	    }
+	  }, {
+	    key: "_trySendPendingInNextTick",
+	    value: function _trySendPendingInNextTick() {
+	      var _this4 = this;
+	      if (!this._pendingFlag) {
+	        this._pendingFlag = true;
+	        Promise.resolve().then(function () {
+	          _this4._sendPending();
+	        });
+	      }
+	    }
+	  }, {
+	    key: "_abortRequest",
+	    value: function _abortRequest(request) {
+	      request._reject(new AbortError());
+	      if (request._worker) {
+	        request._worker.busy = false;
+	      }
+	      this._requests.delete(request._message.id);
+	      this._trySendPendingInNextTick();
+	    }
+	  }]);
+	  return WorkerPool;
+	}();
+
 	function addScript(src) {
 	  return new Promise(function (resolve, reject) {
 	    var s = document.createElement("script");
@@ -26047,17 +27099,54 @@ var hydrogenBundle = (function (exports) {
 	  }));
 	  return _loadOlm.apply(this, arguments);
 	}
-	function main(_x2, _x3) {
-	  return _main.apply(this, arguments);
+	function relPath(path, basePath) {
+	  var idx = basePath.lastIndexOf("/");
+	  var dir = idx === -1 ? "" : basePath.slice(0, idx);
+	  var dirCount = dir.length ? dir.split("/").length : 0;
+	  return "../".repeat(dirCount) + path;
 	}
-	function _main() {
-	  _main = _asyncToGenerator( regeneratorRuntime.mark(function _callee2(container, olmPaths) {
-	    var clock, request, sessionInfoStorage, storageFactory, vm, view;
+	function loadWorker(_x2) {
+	  return _loadWorker.apply(this, arguments);
+	}
+	function _loadWorker() {
+	  _loadWorker = _asyncToGenerator( regeneratorRuntime.mark(function _callee2(paths) {
+	    var workerPool, path;
 	    return regeneratorRuntime.wrap(function _callee2$(_context2) {
 	      while (1) {
 	        switch (_context2.prev = _context2.next) {
 	          case 0:
-	            _context2.prev = 0;
+	            workerPool = new WorkerPool(paths.worker, 4);
+	            _context2.next = 3;
+	            return workerPool.init();
+	          case 3:
+	            path = relPath(paths.olm.legacyBundle, paths.worker);
+	            _context2.next = 6;
+	            return workerPool.sendAll({
+	              type: "load_olm",
+	              path: path
+	            });
+	          case 6:
+	            return _context2.abrupt("return", workerPool);
+	          case 7:
+	          case "end":
+	            return _context2.stop();
+	        }
+	      }
+	    }, _callee2);
+	  }));
+	  return _loadWorker.apply(this, arguments);
+	}
+	function main(_x3, _x4) {
+	  return _main.apply(this, arguments);
+	}
+	function _main() {
+	  _main = _asyncToGenerator( regeneratorRuntime.mark(function _callee3(container, paths) {
+	    var clock, request, sessionInfoStorage, storageFactory, workerPromise, vm, view;
+	    return regeneratorRuntime.wrap(function _callee3$(_context3) {
+	      while (1) {
+	        switch (_context3.prev = _context3.next) {
+	          case 0:
+	            _context3.prev = 0;
 	            clock = new Clock$1();
 	            if (typeof fetch === "function") {
 	              request = createFetchRequest(clock.createTimeout);
@@ -26066,6 +27155,9 @@ var hydrogenBundle = (function (exports) {
 	            }
 	            sessionInfoStorage = new SessionInfoStorage("brawl_sessions_v1");
 	            storageFactory = new StorageFactory();
+	            if (!window.WebAssembly) {
+	              workerPromise = loadWorker(paths);
+	            }
 	            vm = new BrawlViewModel({
 	              createSessionContainer: function createSessionContainer() {
 	                return new SessionContainer({
@@ -26075,7 +27167,8 @@ var hydrogenBundle = (function (exports) {
 	                  sessionInfoStorage: sessionInfoStorage,
 	                  request: request,
 	                  clock: clock,
-	                  olmPromise: loadOlm(olmPaths)
+	                  olmPromise: loadOlm(paths.olm),
+	                  workerPromise: workerPromise
 	                });
 	              },
 	              sessionInfoStorage: sessionInfoStorage,
@@ -26083,23 +27176,23 @@ var hydrogenBundle = (function (exports) {
 	              clock: clock
 	            });
 	            window.__brawlViewModel = vm;
-	            _context2.next = 9;
+	            _context3.next = 10;
 	            return vm.load();
-	          case 9:
+	          case 10:
 	            view = new BrawlView(vm);
 	            container.appendChild(view.mount());
-	            _context2.next = 16;
+	            _context3.next = 17;
 	            break;
-	          case 13:
-	            _context2.prev = 13;
-	            _context2.t0 = _context2["catch"](0);
-	            console.error("".concat(_context2.t0.message, ":\n").concat(_context2.t0.stack));
-	          case 16:
+	          case 14:
+	            _context3.prev = 14;
+	            _context3.t0 = _context3["catch"](0);
+	            console.error("".concat(_context3.t0.message, ":\n").concat(_context3.t0.stack));
+	          case 17:
 	          case "end":
-	            return _context2.stop();
+	            return _context3.stop();
 	        }
 	      }
-	    }, _callee2, null, [[0, 13]]);
+	    }, _callee3, null, [[0, 14]]);
 	  }));
 	  return _main.apply(this, arguments);
 	}
