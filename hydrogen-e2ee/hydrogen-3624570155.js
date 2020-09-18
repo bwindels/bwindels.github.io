@@ -562,8 +562,9 @@ class Reconnector {
         while (!this._versionsResponse) {
             try {
                 this._setState(ConnectionStatus.Reconnecting);
-                const versionsRequest = hsApi.versions({timeout: 30000});
-                this._versionsResponse = await versionsRequest.response();
+                console.info("waiting 1s to reconnect");
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                console.info("reconnecting");
                 this._setState(ConnectionStatus.Online);
             } catch (err) {
                 if (err.name === "ConnectionError") {

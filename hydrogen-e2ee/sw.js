@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 const VERSION = "0.0.37";
-const OFFLINE_FILES = ["hydrogen-3155134245.js","hydrogen-1625084908.css","index.html","icon-317721575.png","icon-3866575052.svg","themes/element/bundle-1000196323.css","themes/bubbles/bundle-2682099160.css"];
+const OFFLINE_FILES = ["hydrogen-3624570155.js","hydrogen-1625084908.css","index.html","icon-317721575.png","icon-3866575052.svg","themes/element/bundle-1000196323.css","themes/bubbles/bundle-2682099160.css"];
 // TODO: cache these files when requested
 // The difficulty is that these are relative filenames, and we don't have access to document.baseURI
 // Clients.match({type: "window"}).url and assume they are all the same? they really should be ... safari doesn't support this though

@@ -14378,7 +14378,6 @@ var hydrogenBundle = (function (exports) {
 	    key: "_reconnectLoop",
 	    value: function () {
 	      var _reconnectLoop2 = _asyncToGenerator( /*#__PURE__*/regeneratorRuntime.mark(function _callee2(hsApi) {
-	        var versionsRequest;
 	        return regeneratorRuntime.wrap(function _callee2$(_context2) {
 	          while (1) {
 	            switch (_context2.prev = _context2.next) {
@@ -14400,14 +14399,15 @@ var hydrogenBundle = (function (exports) {
 	                // a stale connection when we just came online again
 
 
-	                versionsRequest = hsApi.versions({
-	                  timeout: 30000
-	                });
+	                console.info("waiting 1s to reconnect");
 	                _context2.next = 8;
-	                return versionsRequest.response();
+	                return new Promise(function (resolve) {
+	                  return setTimeout(resolve, 1000);
+	                });
 
 	              case 8:
-	                this._versionsResponse = _context2.sent;
+	                console.info("reconnecting"); // const versionsRequest = hsApi.versions({timeout: 30000});
+	                // this._versionsResponse = await versionsRequest.response();
 
 	                this._setState(ConnectionStatus.Online);
 
