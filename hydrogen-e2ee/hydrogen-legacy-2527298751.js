@@ -29801,22 +29801,13 @@ var hydrogenBundle = (function (exports) {
 	                // I think there is a bug here, in that even if the reconnector already started the session, we'd still do this.
 
 
-	                if (!this._session.isStarted) {
-	                  _context3.next = 32;
-	                  break;
+	                if (this._session.isStarted) {
+	                  lastVersionsResponse = {}; //await hsApi.versions({timeout: 10000}).response();
+
+	                  this._session.start(lastVersionsResponse);
 	                }
 
-	                _context3.next = 30;
-	                return hsApi.versions({
-	                  timeout: 10000
-	                }).response();
-
-	              case 30:
-	                lastVersionsResponse = _context3.sent;
-
-	                this._session.start(lastVersionsResponse);
-
-	              case 32:
+	              case 28:
 	              case "end":
 	                return _context3.stop();
 	            }

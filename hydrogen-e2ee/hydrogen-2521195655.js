@@ -6410,7 +6410,7 @@ class SessionContainer {
         await this._waitForFirstSync();
         this._status.set(LoadStatus.Ready);
         if (this._session.isStarted) {
-            const lastVersionsResponse = await hsApi.versions({timeout: 10000}).response();
+            const lastVersionsResponse = {};
             this._session.start(lastVersionsResponse);
         }
     }
