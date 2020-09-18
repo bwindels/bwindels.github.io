@@ -185,6 +185,9 @@ function xhrRequest(url, options) {
 function createEnum(...values) {
     const obj = {};
     for (const value of values) {
+        if (typeof value !== "string") {
+            throw new Error("Invalid enum value name" + value?.toString());
+        }
         obj[value] = value;
     }
     return Object.freeze(obj);
@@ -409,6 +412,16 @@ class HomeServerApi {
     sendToDevice(type, payload, txnId, options = null) {
         return this._put(`/sendToDevice/${encodeURIComponent(type)}/${encodeURIComponent(txnId)}`, null, payload, options);
     }
+    roomKeysVersion(version = null, options = null) {
+        let versionPart = "";
+        if (version) {
+            versionPart = `/${encodeURIComponent(version)}`;
+        }
+        return this._get(`/room_keys/version${versionPart}`, null, null, options);
+    }
+    roomKeyForRoomAndSession(version, roomId, sessionId, options = null) {
+        return this._get(`/room_keys/keys/${encodeURIComponent(roomId)}/${encodeURIComponent(sessionId)}`, {version}, null, options);
+    }
     get mediaRepository() {
         return this._mediaRepository;
     }
@@ -619,6 +632,8 @@ class Sync {
                 this._status.set(SyncStatus.Syncing);
             } catch (err) {
                 if (!(err instanceof AbortError)) {
+                    console.warn("stopping sync because of error");
+                    console.error(err);
                     this._error = err;
                     this._status.set(SyncStatus.Stopped);
                 }
@@ -672,8 +687,6 @@ class Sync {
             }));
             sessionChanges = await this._session.writeSync(response, syncFilterId, syncTxn);
         } catch(err) {
-            console.warn("aborting syncTxn because of error");
-            console.error(err);
             syncTxn.abort();
             throw err;
         }
@@ -721,7 +734,9 @@ class Sync {
             storeNames.userIdentities,
             storeNames.groupSessionDecryptions,
             storeNames.deviceIdentities,
-            storeNames.outboundGroupSessions
+            storeNames.outboundGroupSessions,
+            storeNames.operations,
+            storeNames.accountData,
         ]);
     }
     _parseRoomsResponse(roomsSection, isInitialSync) {
@@ -878,7 +893,7 @@ function stringifyObject(object) {
 }
 var anotherJson = {stringify: stringify};
 
-const DecryptionSource = createEnum(["Sync", "Timeline", "Retry"]);
+const DecryptionSource = createEnum("Sync", "Timeline", "Retry");
 const SESSION_KEY_PREFIX = "e2ee:";
 const OLM_ALGORITHM = "m.olm.v1.curve25519-aes-sha2";
 const MEGOLM_ALGORITHM = "m.megolm.v1.aes-sha2";
@@ -909,7 +924,16 @@ function verifyEd25519Signature(olmUtil, userId, deviceOrKeyId, ed25519Key, valu
     }
 }
 
-function applySyncResponse(data, roomResponse, membership, isInitialSync, isTimelineOpen, ownUserId) {
+function applyTimelineEntries(data, timelineEntries, isInitialSync, isTimelineOpen, ownUserId) {
+    if (timelineEntries.length) {
+        data = timelineEntries.reduce((data, entry) => {
+            return processTimelineEvent(data, entry,
+                isInitialSync, isTimelineOpen, ownUserId);
+        }, data);
+    }
+    return data;
+}
+function applySyncResponse(data, roomResponse, membership) {
     if (roomResponse.summary) {
         data = updateSummary(data, roomResponse.summary);
     }
@@ -928,10 +952,8 @@ function applySyncResponse(data, roomResponse, membership, isInitialSync, isTime
         data = timeline.events.reduce((data, event) => {
             if (typeof event.state_key === "string") {
                 return processStateEvent(data, event);
-            } else {
-                return processTimelineEvent(data, event,
-                    isInitialSync, isTimelineOpen, ownUserId);
             }
+            return data;
         }, data);
     }
     const unreadNotifications = roomResponse.unread_notifications;
@@ -979,17 +1001,21 @@ function processStateEvent(data, event) {
     }
     return data;
 }
-function processTimelineEvent(data, event, isInitialSync, isTimelineOpen, ownUserId) {
-    if (event.type === "m.room.message") {
-        data = data.cloneIfNeeded();
-        data.lastMessageTimestamp = event.origin_server_ts;
-        if (!isInitialSync && event.sender !== ownUserId && !isTimelineOpen) {
+function processTimelineEvent(data, eventEntry, isInitialSync, isTimelineOpen, ownUserId) {
+    if (eventEntry.eventType === "m.room.message") {
+        if (!data.lastMessageTimestamp || eventEntry.timestamp > data.lastMessageTimestamp) {
+            data = data.cloneIfNeeded();
+            data.lastMessageTimestamp = eventEntry.timestamp;
+        }
+        if (!isInitialSync && eventEntry.sender !== ownUserId && !isTimelineOpen) {
+            data = data.cloneIfNeeded();
             data.isUnread = true;
         }
-        const {content} = event;
+        const {content} = eventEntry;
         const body = content?.body;
         const msgtype = content?.msgtype;
-        if (msgtype === "m.text") {
+        if (msgtype === "m.text" && !eventEntry.isEncrypted) {
+            data = data.cloneIfNeeded();
             data.lastMessageBody = body;
         }
     }
@@ -1126,11 +1152,23 @@ class RoomSummary {
         txn.roomSummary.set(data.serialize());
         return data;
     }
-	writeSync(roomResponse, membership, isInitialSync, isTimelineOpen, txn) {
+    processTimelineEntries(timelineEntries, isInitialSync, isTimelineOpen) {
         this._data.cloned = false;
-		const data = applySyncResponse(
-            this._data, roomResponse,
-            membership,
+        const data = applyTimelineEntries(
+            this._data,
+            timelineEntries,
+            isInitialSync, isTimelineOpen,
+            this._ownUserId);
+        if (data !== this._data) {
+            return data;
+        }
+    }
+	writeSync(roomResponse, timelineEntries, membership, isInitialSync, isTimelineOpen, txn) {
+        this._data.cloned = false;
+        let data = applySyncResponse(this._data, roomResponse, membership);
+        data = applyTimelineEntries(
+            data,
+            timelineEntries,
             isInitialSync, isTimelineOpen,
             this._ownUserId);
 		if (data !== this._data) {
@@ -1138,6 +1176,19 @@ class RoomSummary {
             return data;
 		}
 	}
+    async writeAndApplyChanges(data, storage) {
+        const txn = await storage.readWriteTxn([
+            storage.storeNames.roomSummary,
+        ]);
+        try {
+            txn.roomSummary.set(data.serialize());
+        } catch (err) {
+            txn.abort();
+            throw err;
+        }
+        await txn.complete();
+        this.applyChanges(data);
+    }
     applyChanges(data) {
         this._data = data;
     }
@@ -1287,6 +1338,9 @@ class EventEntry extends BaseEntry {
     }
     setDecryptionError(err) {
         this._decryptionError = err;
+    }
+    get decryptionError() {
+        return this._decryptionError;
     }
 }
 
@@ -1478,12 +1532,6 @@ class RoomMember {
             displayName,
         });
     }
-    get needsRoomKey() {
-        return this._data.needsRoomKey;
-    }
-    set needsRoomKey(value) {
-        this._data.needsRoomKey = !!value;
-    }
     get membership() {
         return this._data.membership;
     }
@@ -1603,43 +1651,36 @@ class SyncWriter {
         this._fragmentIdComparer.append(newFragmentId, oldFragmentId);
         return {oldFragment, newFragment};
     }
-    async _writeMember(event, trackNewlyJoined, txn) {
+    _writeMember(event, txn) {
         const userId = event.state_key;
         if (userId) {
             const memberChange = new MemberChange(this._roomId, event);
             const {member} = memberChange;
             if (member) {
-                if (trackNewlyJoined) {
-                    const existingMemberData = await txn.roomMembers.get(this._roomId, userId);
-                    member.needsRoomKey = existingMemberData?.needsRoomKey || memberChange.hasJoined;
-                }
                 txn.roomMembers.set(member.serialize());
                 return memberChange;
             }
         }
     }
-    async _writeStateEvent(event, trackNewlyJoined, txn) {
+    _writeStateEvent(event, txn) {
         if (event.type === EVENT_TYPE) {
-            return await this._writeMember(event, trackNewlyJoined, txn);
+            return this._writeMember(event, txn);
         } else {
             txn.roomState.set(this._roomId, event);
         }
     }
-    async _writeStateEvents(roomResponse, trackNewlyJoined, txn) {
-        const memberChanges = new Map();
+    _writeStateEvents(roomResponse, memberChanges, txn) {
         const {state} = roomResponse;
         if (Array.isArray(state?.events)) {
-            await Promise.all(state.events.map(async event => {
-                const memberChange = await this._writeStateEvent(event, trackNewlyJoined, txn);
+            for (const event of state.events) {
+                const memberChange = this._writeStateEvent(event, txn);
                 if (memberChange) {
                     memberChanges.set(memberChange.userId, memberChange);
                 }
-            }));
+            }
         }
-        return memberChanges;
     }
-    async _writeTimeline(entries, timeline, currentKey, trackNewlyJoined, txn) {
-        const memberChanges = new Map();
+    async _writeTimeline(entries, timeline, currentKey, memberChanges, txn) {
         if (Array.isArray(timeline.events)) {
             const events = deduplicateEvents(timeline.events);
             for(const event of events) {
@@ -1652,17 +1693,15 @@ class SyncWriter {
                 }
                 txn.timelineEvents.insert(entry);
                 entries.push(new EventEntry(entry, this._fragmentIdComparer));
-            }
-            await Promise.all(events.filter(event => {
-                return typeof event.state_key === "string";
-            }).map(async stateEvent => {
-                const memberChange = await this._writeStateEvent(stateEvent, trackNewlyJoined, txn);
-                if (memberChange) {
-                    memberChanges.set(memberChange.userId, memberChange);
+                if (typeof event.state_key === "string") {
+                    const memberChange = this._writeStateEvent(event, txn);
+                    if (memberChange) {
+                        memberChanges.set(memberChange.userId, memberChange);
+                    }
                 }
-            }));
+            }
         }
-        return {currentKey, memberChanges};
+        return currentKey;
     }
     async _findMemberData(userId, events, txn) {
         const memberData = await txn.roomMembers.get(this._roomId, userId);
@@ -1677,7 +1716,7 @@ class SyncWriter {
             }
         }
     }
-    async writeSync(roomResponse, trackNewlyJoined, txn) {
+    async writeSync(roomResponse, txn) {
         const entries = [];
         const {timeline} = roomResponse;
         let currentKey = this._lastLiveKey;
@@ -1692,12 +1731,9 @@ class SyncWriter {
             entries.push(FragmentBoundaryEntry.end(oldFragment, this._fragmentIdComparer));
             entries.push(FragmentBoundaryEntry.start(newFragment, this._fragmentIdComparer));
         }
-        const memberChanges = await this._writeStateEvents(roomResponse, trackNewlyJoined, txn);
-        const timelineResult = await this._writeTimeline(entries, timeline, currentKey, trackNewlyJoined, txn);
-        currentKey = timelineResult.currentKey;
-        for (const [userId, memberChange] of timelineResult.memberChanges.entries()) {
-            memberChanges.set(userId, memberChange);
-        }
+        const memberChanges = new Map();
+        this._writeStateEvents(roomResponse, memberChanges, txn);
+        currentKey = await this._writeTimeline(entries, timeline, currentKey, memberChanges, txn);
         return {entries, newLiveKey: currentKey, memberChanges};
     }
     afterSync(newLiveKey) {
@@ -2196,6 +2232,7 @@ class SortedArray extends BaseObservableList {
         const idx = this.indexOf(item);
         if (idx !== -1) {
             this._items[idx] = item;
+            this.emitUpdate(idx, item, null);
         }
     }
     indexOf(item) {
@@ -2517,10 +2554,11 @@ class TimelineReader {
 }
 
 class PendingEventEntry extends BaseEntry {
-    constructor({pendingEvent, user}) {
+    constructor({pendingEvent, user, clock}) {
         super(null);
         this._pendingEvent = pendingEvent;
         this._user = user;
+        this._clock = clock;
     }
     get fragmentId() {
         return PENDING_FRAGMENT_ID;
@@ -2544,7 +2582,7 @@ class PendingEventEntry extends BaseEntry {
         return this._user.id;
     }
     get timestamp() {
-        return null;
+        return this._clock.now();
     }
     get isPending() {
         return true;
@@ -2557,7 +2595,7 @@ class PendingEventEntry extends BaseEntry {
 }
 
 class Timeline {
-    constructor({roomId, storage, closeCallback, fragmentIdComparer, pendingEvents, user}) {
+    constructor({roomId, storage, closeCallback, fragmentIdComparer, pendingEvents, user, clock}) {
         this._roomId = roomId;
         this._storage = storage;
         this._closeCallback = closeCallback;
@@ -2571,7 +2609,7 @@ class Timeline {
         });
         this._readerRequest = null;
         const localEntries = new MappedList(pendingEvents, pe => {
-            return new PendingEventEntry({pendingEvent: pe, user});
+            return new PendingEventEntry({pendingEvent: pe, user, clock});
         }, (pee, params) => {
             pee.notifyUpdate(params);
         });
@@ -3097,7 +3135,7 @@ class Heroes {
 
 const EVENT_ENCRYPTED_TYPE = "m.room.encrypted";
 class Room extends EventEmitter {
-	constructor({roomId, storage, hsApi, emitCollectionChange, sendScheduler, pendingEvents, user, createRoomEncryption, getSyncToken}) {
+	constructor({roomId, storage, hsApi, emitCollectionChange, sendScheduler, pendingEvents, user, createRoomEncryption, getSyncToken, clock}) {
         super();
         this._roomId = roomId;
         this._storage = storage;
@@ -3114,6 +3152,7 @@ class Room extends EventEmitter {
         this._createRoomEncryption = createRoomEncryption;
         this._roomEncryption = null;
         this._getSyncToken = getSyncToken;
+        this._clock = clock;
 	}
     async notifyRoomKeys(roomKeys) {
         if (this._roomEncryption) {
@@ -3132,8 +3171,11 @@ class Room extends EventEmitter {
                 }
                 const decryptRequest = this._decryptEntries(DecryptionSource.Retry, retryEntries, txn);
                 await decryptRequest.complete();
-                if (this._timeline) {
-                    this._timeline.replaceEntries(retryEntries);
+                this._timeline?.replaceEntries(retryEntries);
+                const changes = this._summary.processTimelineEntries(retryEntries, false, this._isTimelineOpen);
+                if (changes) {
+                    this._summary.writeAndApplyChanges(changes, this._storage);
+                    this._emitUpdate();
                 }
             }
         }
@@ -3207,7 +3249,7 @@ class Room extends EventEmitter {
             decryption = await decryptChanges.write(txn);
         }
 		const {entries, newLiveKey, memberChanges} =
-            await this._syncWriter.writeSync(roomResponse, this.isTrackingMembers, txn);
+            await this._syncWriter.writeSync(roomResponse, txn);
         if (decryption) {
             decryption.applyToEntries(entries);
         }
@@ -3216,11 +3258,12 @@ class Room extends EventEmitter {
         }
 		const summaryChanges = this._summary.writeSync(
             roomResponse,
+            entries,
             membership,
             isInitialSync, this._isTimelineOpen,
             txn);
         let heroChanges;
-        if (needsHeroes(summaryChanges)) {
+        if (summaryChanges && needsHeroes(summaryChanges)) {
             if (!this._heroes) {
                 this._heroes = new Heroes(this._roomId);
             }
@@ -3270,8 +3313,7 @@ class Room extends EventEmitter {
             }
         }
         if (emitChange) {
-            this.emit("change");
-            this._emitCollectionChange(this);
+            this._emitUpdate();
         }
         if (this._timeline) {
             this._timeline.appendLiveEntries(newTimelineEntries);
@@ -3283,17 +3325,20 @@ class Room extends EventEmitter {
     needsAfterSyncCompleted({memberChanges}) {
         return this._roomEncryption?.needsToShareKeys(memberChanges);
     }
-    async afterSyncCompleted({memberChanges}) {
+    async afterSyncCompleted() {
         if (this._roomEncryption) {
-            await this._roomEncryption.shareRoomKeyForMemberChanges(memberChanges, this._hsApi);
+            await this._roomEncryption.flushPendingRoomKeyShares(this._hsApi);
         }
     }
-    async start() {
+    async start(pendingOperations) {
         if (this._roomEncryption) {
             try {
-                await this._roomEncryption.shareRoomKeyToPendingMembers(this._hsApi);
+                const roomKeyShares = pendingOperations?.get("share_room_key");
+                if (roomKeyShares) {
+                    await this._roomEncryption.flushPendingRoomKeyShares(this._hsApi, roomKeyShares);
+                }
             } catch (err) {
-                console.error(`could not send out pending room keys for room ${this.id}`, err.stack);
+                console.error(`could not send out (all) pending room keys for room ${this.id}`, err.stack);
             }
         }
         this._sendQueue.resumeSending();
@@ -3420,6 +3465,9 @@ class Room extends EventEmitter {
     get isEncrypted() {
         return !!this._summary.encryption;
     }
+    enableSessionBackup(sessionBackup) {
+        this._roomEncryption?.enableSessionBackup(sessionBackup);
+    }
     get isTrackingMembers() {
         return this._summary.isTrackingMembers;
     }
@@ -3436,6 +3484,10 @@ class Room extends EventEmitter {
     get _isTimelineOpen() {
         return !!this._timeline;
     }
+    _emitUpdate() {
+        this.emit("change");
+        this._emitCollectionChange(this);
+    }
     async clearUnread() {
         if (this.isUnread || this.notificationCount) {
             const txn = await this._storage.readWriteTxn([
@@ -3450,8 +3502,7 @@ class Room extends EventEmitter {
             }
             await txn.complete();
             this._summary.applyChanges(data);
-            this.emit("change");
-            this._emitCollectionChange(this);
+            this._emitUpdate();
             try {
                 const lastEventId = await this._getLastEventId();
                 if (lastEventId) {
@@ -3482,6 +3533,7 @@ class Room extends EventEmitter {
                 }
             },
             user: this._user,
+            clock: this._clock
         });
         if (this._roomEncryption) {
             this._timeline.enableEncryption(this._decryptEntries.bind(this, DecryptionSource.Timeline));
@@ -3496,6 +3548,10 @@ class Room extends EventEmitter {
     }
     applyIsTrackingMembersChanges(changes) {
         this._summary.applyChanges(changes);
+    }
+    dispose() {
+        this._roomEncryption?.dispose();
+        this._timeline?.dispose();
     }
 }
 class DecryptionRequest {
@@ -3700,7 +3756,7 @@ const ACCOUNT_SESSION_KEY = SESSION_KEY_PREFIX + "olmAccount";
 const DEVICE_KEY_FLAG_SESSION_KEY = SESSION_KEY_PREFIX + "areDeviceKeysUploaded";
 const SERVER_OTK_COUNT_SESSION_KEY = SESSION_KEY_PREFIX + "serverOTKCount";
 class Account {
-    static async load({olm, pickleKey, hsApi, userId, deviceId, txn}) {
+    static async load({olm, pickleKey, hsApi, userId, deviceId, olmWorker, txn}) {
         const pickledAccount = await txn.session.get(ACCOUNT_SESSION_KEY);
         if (pickledAccount) {
             const account = new olm.Account();
@@ -3708,22 +3764,35 @@ class Account {
             account.unpickle(pickleKey, pickledAccount);
             const serverOTKCount = await txn.session.get(SERVER_OTK_COUNT_SESSION_KEY);
             return new Account({pickleKey, hsApi, account, userId,
-                deviceId, areDeviceKeysUploaded, serverOTKCount, olm});
+                deviceId, areDeviceKeysUploaded, serverOTKCount, olm, olmWorker});
         }
     }
-    static async create({olm, pickleKey, hsApi, userId, deviceId, txn}) {
+    static async create({olm, pickleKey, hsApi, userId, deviceId, olmWorker, storage}) {
         const account = new olm.Account();
-        account.create();
-        account.generate_one_time_keys(account.max_number_of_one_time_keys());
+        if (olmWorker) {
+            await olmWorker.createAccountAndOTKs(account, account.max_number_of_one_time_keys());
+        } else {
+            account.create();
+            account.generate_one_time_keys(account.max_number_of_one_time_keys());
+        }
         const pickledAccount = account.pickle(pickleKey);
         const areDeviceKeysUploaded = false;
-        await txn.session.add(ACCOUNT_SESSION_KEY, pickledAccount);
-        await txn.session.add(DEVICE_KEY_FLAG_SESSION_KEY, areDeviceKeysUploaded);
-        await txn.session.add(SERVER_OTK_COUNT_SESSION_KEY, 0);
+        const txn = await storage.readWriteTxn([
+            storage.storeNames.session
+        ]);
+        try {
+            txn.session.add(ACCOUNT_SESSION_KEY, pickledAccount);
+            txn.session.add(DEVICE_KEY_FLAG_SESSION_KEY, areDeviceKeysUploaded);
+            txn.session.add(SERVER_OTK_COUNT_SESSION_KEY, 0);
+        } catch (err) {
+            txn.abort();
+            throw err;
+        }
+        await txn.complete();
         return new Account({pickleKey, hsApi, account, userId,
-            deviceId, areDeviceKeysUploaded, serverOTKCount: 0, olm});
+            deviceId, areDeviceKeysUploaded, serverOTKCount: 0, olm, olmWorker});
     }
-    constructor({pickleKey, hsApi, account, userId, deviceId, areDeviceKeysUploaded, serverOTKCount, olm}) {
+    constructor({pickleKey, hsApi, account, userId, deviceId, areDeviceKeysUploaded, serverOTKCount, olm, olmWorker}) {
         this._olm = olm;
         this._pickleKey = pickleKey;
         this._hsApi = hsApi;
@@ -3732,6 +3801,7 @@ class Account {
         this._deviceId = deviceId;
         this._areDeviceKeysUploaded = areDeviceKeysUploaded;
         this._serverOTKCount = serverOTKCount;
+        this._olmWorker = olmWorker;
         this._identityKeys = JSON.parse(this._account.identity_keys());
     }
     get identityKeys() {
@@ -4452,10 +4522,7 @@ class DecryptionChanges$1 {
             });
         }
         if (!decryption) {
-            txn.groupSessionDecryptions.set({
-                roomId,
-                sessionId,
-                messageIndex,
+            txn.groupSessionDecryptions.set(roomId, sessionId, messageIndex, {
                 eventId,
                 timestamp
             });
@@ -4510,12 +4577,12 @@ class ReplayDetectionEntry {
 }
 
 class SessionDecryption {
-    constructor(sessionInfo, events, decryptor) {
+    constructor(sessionInfo, events, olmWorker) {
         sessionInfo.retain();
         this._sessionInfo = sessionInfo;
         this._events = events;
-        this._decryptor = decryptor;
-        this._decryptionRequests = decryptor ? [] : null;
+        this._olmWorker = olmWorker;
+        this._decryptionRequests = olmWorker ? [] : null;
     }
     async decryptAll() {
         const replayEntries = [];
@@ -4527,8 +4594,8 @@ class SessionDecryption {
                 const {session} = this._sessionInfo;
                 const ciphertext = event.content.ciphertext;
                 let decryptionResult;
-                if (this._decryptor) {
-                    const request = this._decryptor.decrypt(session, ciphertext);
+                if (this._olmWorker) {
+                    const request = this._olmWorker.megolmDecrypt(session, ciphertext);
                     this._decryptionRequests.push(request);
                     decryptionResult = await request.response();
                 } else {
@@ -4608,16 +4675,6 @@ class SessionCache {
     }
 }
 
-class DecryptionWorker {
-    constructor(workerPool) {
-        this._workerPool = workerPool;
-    }
-    decrypt(session, ciphertext) {
-        const sessionKey = session.export_session(session.first_known_index());
-        return this._workerPool.send({type: "megolm_decrypt", ciphertext, sessionKey});
-    }
-}
-
 function getSenderKey(event) {
     return event.content?.["sender_key"];
 }
@@ -4628,10 +4685,10 @@ function getCiphertext(event) {
     return event.content?.ciphertext;
 }
 class Decryption$1 {
-    constructor({pickleKey, olm, workerPool}) {
+    constructor({pickleKey, olm, olmWorker}) {
         this._pickleKey = pickleKey;
         this._olm = olm;
-        this._decryptor = workerPool ? new DecryptionWorker(workerPool) : null;
+        this._olmWorker = olmWorker;
     }
     createSessionCache(fallback) {
         return new SessionCache(fallback);
@@ -4663,7 +4720,7 @@ class Decryption$1 {
                     errors.set(event.event_id, new DecryptionError("MEGOLM_NO_SESSION", event));
                 }
             } else {
-                sessionDecryptions.push(new SessionDecryption(sessionInfo, eventsForSession, this._decryptor));
+                sessionDecryptions.push(new SessionDecryption(sessionInfo, eventsForSession, this._olmWorker));
             }
         }));
         return new DecryptionPreparation(roomId, sessionDecryptions, errors);
@@ -4701,26 +4758,165 @@ class Decryption$1 {
             ) {
                 return;
             }
-            const hasSession = await txn.inboundGroupSessions.has(roomId, senderKey, sessionId);
-            if (!hasSession) {
-                const session = new this._olm.InboundGroupSession();
-                try {
-                    session.create(sessionKey);
-                    const sessionEntry = {
-                        roomId,
-                        senderKey,
-                        sessionId,
-                        session: session.pickle(this._pickleKey),
-                        claimedKeys: {ed25519: claimedEd25519Key},
-                    };
-                    txn.inboundGroupSessions.set(sessionEntry);
+            const session = new this._olm.InboundGroupSession();
+            try {
+                session.create(sessionKey);
+                const sessionEntry = await this._writeInboundSession(
+                    session, roomId, senderKey, claimedEd25519Key, sessionId, txn);
+                if (sessionEntry) {
                     newSessions.push(sessionEntry);
-                } finally {
-                    session.free();
                 }
+            } finally {
+                session.free();
             }
         }
         return newSessions;
+    }
+    async addRoomKeyFromBackup(roomId, sessionId, sessionInfo, txn) {
+        const sessionKey = sessionInfo["session_key"];
+        const senderKey = sessionInfo["sender_key"];
+        const claimedEd25519Key = sessionInfo["sender_claimed_keys"]?.["ed25519"];
+        if (
+            typeof roomId !== "string" ||
+            typeof sessionId !== "string" ||
+            typeof senderKey !== "string" ||
+            typeof sessionKey !== "string" ||
+            typeof claimedEd25519Key !== "string"
+        ) {
+            return;
+        }
+        const session = new this._olm.InboundGroupSession();
+        try {
+            session.import_session(sessionKey);
+            return await this._writeInboundSession(
+                session, roomId, senderKey, claimedEd25519Key, sessionId, txn);
+        } finally {
+            session.free();
+        }
+    }
+    async _writeInboundSession(session, roomId, senderKey, claimedEd25519Key, sessionId, txn) {
+        let incomingSessionIsBetter = true;
+        const existingSessionEntry = await txn.inboundGroupSessions.get(roomId, senderKey, sessionId);
+        if (existingSessionEntry) {
+            const existingSession = new this._olm.InboundGroupSession();
+            try {
+                existingSession.unpickle(this._pickleKey, existingSessionEntry.session);
+                incomingSessionIsBetter = session.first_known_index() < existingSession.first_known_index();
+            } finally {
+                existingSession.free();
+            }
+        }
+        if (incomingSessionIsBetter) {
+            const sessionEntry = {
+                roomId,
+                senderKey,
+                sessionId,
+                session: session.pickle(this._pickleKey),
+                claimedKeys: {ed25519: claimedEd25519Key},
+            };
+            txn.inboundGroupSessions.set(sessionEntry);
+            return sessionEntry;
+        }
+    }
+}
+
+function createCommonjsModule(fn, basedir, module) {
+	return module = {
+	  path: basedir,
+	  exports: {},
+	  require: function (path, base) {
+      return commonjsRequire(path, (base === undefined || base === null) ? module.path : base);
+    }
+	}, fn(module, module.exports), module.exports;
+}
+function commonjsRequire () {
+	throw new Error('Dynamic requires are not currently supported by @rollup/plugin-commonjs');
+}
+var base64Arraybuffer = createCommonjsModule(function (module, exports) {
+(function(){
+  var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  var lookup = new Uint8Array(256);
+  for (var i = 0; i < chars.length; i++) {
+    lookup[chars.charCodeAt(i)] = i;
+  }
+  exports.encode = function(arraybuffer) {
+    var bytes = new Uint8Array(arraybuffer),
+    i, len = bytes.length, base64 = "";
+    for (i = 0; i < len; i+=3) {
+      base64 += chars[bytes[i] >> 2];
+      base64 += chars[((bytes[i] & 3) << 4) | (bytes[i + 1] >> 4)];
+      base64 += chars[((bytes[i + 1] & 15) << 2) | (bytes[i + 2] >> 6)];
+      base64 += chars[bytes[i + 2] & 63];
+    }
+    if ((len % 3) === 2) {
+      base64 = base64.substring(0, base64.length - 1) + "=";
+    } else if (len % 3 === 1) {
+      base64 = base64.substring(0, base64.length - 2) + "==";
+    }
+    return base64;
+  };
+  exports.decode =  function(base64) {
+    var bufferLength = base64.length * 0.75,
+    len = base64.length, i, p = 0,
+    encoded1, encoded2, encoded3, encoded4;
+    if (base64[base64.length - 1] === "=") {
+      bufferLength--;
+      if (base64[base64.length - 2] === "=") {
+        bufferLength--;
+      }
+    }
+    var arraybuffer = new ArrayBuffer(bufferLength),
+    bytes = new Uint8Array(arraybuffer);
+    for (i = 0; i < len; i+=4) {
+      encoded1 = lookup[base64.charCodeAt(i)];
+      encoded2 = lookup[base64.charCodeAt(i+1)];
+      encoded3 = lookup[base64.charCodeAt(i+2)];
+      encoded4 = lookup[base64.charCodeAt(i+3)];
+      bytes[p++] = (encoded1 << 2) | (encoded2 >> 4);
+      bytes[p++] = ((encoded2 & 15) << 4) | (encoded3 >> 2);
+      bytes[p++] = ((encoded3 & 3) << 6) | (encoded4 & 63);
+    }
+    return arraybuffer;
+  };
+})();
+});
+
+class SessionBackup {
+    constructor({backupInfo, decryption, hsApi}) {
+        this._backupInfo = backupInfo;
+        this._decryption = decryption;
+        this._hsApi = hsApi;
+    }
+    async getSession(roomId, sessionId) {
+        const sessionResponse = await this._hsApi.roomKeyForRoomAndSession(this._backupInfo.version, roomId, sessionId).response();
+        const sessionInfo = this._decryption.decrypt(
+            sessionResponse.session_data.ephemeral,
+            sessionResponse.session_data.mac,
+            sessionResponse.session_data.ciphertext,
+        );
+        return JSON.parse(sessionInfo);
+    }
+    dispose() {
+        this._decryption.free();
+    }
+    static async fromSecretStorage({olm, secretStorage, hsApi, txn}) {
+        const base64PrivateKey = await secretStorage.readSecret("m.megolm_backup.v1", txn);
+        if (base64PrivateKey) {
+            const privateKey = new Uint8Array(base64Arraybuffer.decode(base64PrivateKey));
+            const backupInfo = await hsApi.roomKeysVersion().response();
+            const expectedPubKey = backupInfo.auth_data.public_key;
+            const decryption = new olm.PkDecryption();
+            try {
+                const pubKey = decryption.init_with_private_key(privateKey);
+                if (pubKey !== expectedPubKey) {
+                    throw new Error(`Bad backup key, public key does not match. Calculated ${pubKey} but expected ${expectedPubKey}`);
+                }
+            } catch(err) {
+                decryption.free();
+                throw err;
+            }
+            return new SessionBackup({backupInfo, decryption, hsApi});
+        }
     }
 }
 
@@ -4858,8 +5054,15 @@ class EncryptionResult {
 }
 
 const ENCRYPTED_TYPE = "m.room.encrypted";
+function encodeMissingSessionKey(senderKey, sessionId) {
+    return `${senderKey}|${sessionId}`;
+}
+function decodeMissingSessionKey(key) {
+    const [senderKey, sessionId] = key.split("|");
+    return {senderKey, sessionId};
+}
 class RoomEncryption {
-    constructor({room, deviceTracker, olmEncryption, megolmEncryption, megolmDecryption, encryptionParams, storage}) {
+    constructor({room, deviceTracker, olmEncryption, megolmEncryption, megolmDecryption, encryptionParams, storage, sessionBackup, notifyMissingMegolmSession, clock}) {
         this._room = room;
         this._deviceTracker = deviceTracker;
         this._olmEncryption = olmEncryption;
@@ -4871,6 +5074,20 @@ class RoomEncryption {
         this._eventIdsByMissingSession = new Map();
         this._senderDeviceCache = new Map();
         this._storage = storage;
+        this._sessionBackup = sessionBackup;
+        this._notifyMissingMegolmSession = notifyMissingMegolmSession;
+        this._clock = clock;
+        this._disposed = false;
+    }
+    async enableSessionBackup(sessionBackup) {
+        if (this._sessionBackup) {
+            return;
+        }
+        this._sessionBackup = sessionBackup;
+        for(const key of this._eventIdsByMissingSession.keys()) {
+            const {senderKey, sessionId} = decodeMissingSessionKey(key);
+            await this._requestMissingSessionFromBackup(senderKey, sessionId, null);
+        }
     }
     notifyTimelineClosed() {
         this._megolmBackfillCache.dispose();
@@ -4878,13 +5095,14 @@ class RoomEncryption {
         this._senderDeviceCache = new Map();
     }
     async writeMemberChanges(memberChanges, txn) {
-        for (const m of memberChanges.values()) {
-            if (m.hasLeft) {
-                this._megolmEncryption.discardOutboundSession(this._room.id, txn);
-                break;
-            }
+        const memberChangesArray = Array.from(memberChanges.values());
+        if (memberChangesArray.some(m => m.hasLeft)) {
+            this._megolmEncryption.discardOutboundSession(this._room.id, txn);
         }
-        return await this._deviceTracker.writeMemberChanges(this._room, memberChanges, txn);
+        if (memberChangesArray.some(m => m.hasJoined)) {
+            await this._addShareRoomKeyOperationForNewMembers(memberChangesArray, txn);
+        }
+        await this._deviceTracker.writeMemberChanges(this._room, memberChanges, txn);
     }
     async prepareDecryptAll(events, source, isTimelineOpen, txn) {
         const errors = [];
@@ -4905,7 +5123,7 @@ class RoomEncryption {
         } else if (source === DecryptionSource.Timeline) {
             sessionCache = this._megolmBackfillCache;
         } else if (source === DecryptionSource.Retry) {
-            customCache = this._megolmEncryption.createSessionCache();
+            customCache = this._megolmDecryption.createSessionCache();
             sessionCache = customCache;
         } else {
             throw new Error("Unknown source: " + source);
@@ -4915,12 +5133,12 @@ class RoomEncryption {
         if (customCache) {
             customCache.dispose();
         }
-        return new DecryptionPreparation$1(preparation, errors, {isTimelineOpen}, this);
+        return new DecryptionPreparation$1(preparation, errors, {isTimelineOpen, source}, this);
     }
     async _processDecryptionResults(results, errors, flags, txn) {
         for (const error of errors.values()) {
             if (error.code === "MEGOLM_NO_SESSION") {
-                this._addMissingSessionEvent(error.event);
+                this._addMissingSessionEvent(error.event, flags.source);
             }
         }
         if (flags.isTimelineOpen) {
@@ -4941,21 +5159,60 @@ class RoomEncryption {
             result.setRoomNotTrackedYet();
         }
     }
-    _addMissingSessionEvent(event) {
+    _addMissingSessionEvent(event, source) {
         const senderKey = event.content?.["sender_key"];
         const sessionId = event.content?.["session_id"];
-        const key = `${senderKey}|${sessionId}`;
+        const key = encodeMissingSessionKey(senderKey, sessionId);
         let eventIds = this._eventIdsByMissingSession.get(key);
         if (!eventIds) {
+            this._requestMissingSessionFromBackup(senderKey, sessionId, source);
             eventIds = new Set();
             this._eventIdsByMissingSession.set(key, eventIds);
         }
         eventIds.add(event.event_id);
     }
+    async _requestMissingSessionFromBackup(senderKey, sessionId, source) {
+        if (!this._sessionBackup) {
+            this._notifyMissingMegolmSession();
+            return;
+        }
+        if (source === DecryptionSource.Sync) {
+            await this._clock.createTimeout(10000).elapsed();
+            if (this._disposed || !this._eventIdsByMissingSession.has(encodeMissingSessionKey(senderKey, sessionId))) {
+                return;
+            }
+        }
+        try {
+            const session = await this._sessionBackup.getSession(this._room.id, sessionId);
+            if (session?.algorithm === MEGOLM_ALGORITHM) {
+                if (session["sender_key"] !== senderKey) {
+                    console.warn("Got session key back from backup with different sender key, ignoring", {session, senderKey});
+                    return;
+                }
+                const txn = await this._storage.readWriteTxn([this._storage.storeNames.inboundGroupSessions]);
+                let roomKey;
+                try {
+                    roomKey = await this._megolmDecryption.addRoomKeyFromBackup(
+                        this._room.id, sessionId, session, txn);
+                } catch (err) {
+                    txn.abort();
+                    throw err;
+                }
+                await txn.complete();
+                if (roomKey) {
+                    await this._room.notifyRoomKeys([roomKey]);
+                }
+            } else if (session?.algorithm) {
+                console.info(`Backed-up session of unknown algorithm: ${session.algorithm}`);
+            }
+        } catch (err) {
+            console.error(`Could not get session ${sessionId} from backup`, err);
+        }
+    }
     applyRoomKeys(roomKeys) {
         const retryEventIds = [];
         for (const roomKey of roomKeys) {
-            const key = `${roomKey.senderKey}|${roomKey.sessionId}`;
+            const key = encodeMissingSessionKey(roomKey.senderKey, roomKey.sessionId);
             const entriesForSession = this._eventIdsByMissingSession.get(key);
             if (entriesForSession) {
                 this._eventIdsByMissingSession.delete(key);
@@ -4965,13 +5222,10 @@ class RoomEncryption {
         return retryEventIds;
     }
     async encrypt(type, content, hsApi) {
+        await this._deviceTracker.trackRoom(this._room);
         const megolmResult = await this._megolmEncryption.encrypt(this._room.id, type, content, this._encryptionParams);
         if (megolmResult.roomKeyMessage) {
-            await this._deviceTracker.trackRoom(this._room);
-            const devices = await this._deviceTracker.devicesForTrackedRoom(this._room.id, hsApi);
-            await this._sendRoomKey(megolmResult.roomKeyMessage, devices, hsApi);
-            const userIds = Array.from(devices.reduce((set, device) => set.add(device.userId), new Set()));
-            await this._clearNeedsRoomKeyFlag(userIds);
+            this._shareNewRoomKey(megolmResult.roomKeyMessage, hsApi);
         }
         return {
             type: ENCRYPTED_TYPE,
@@ -4980,56 +5234,73 @@ class RoomEncryption {
     }
     needsToShareKeys(memberChanges) {
         for (const m of memberChanges.values()) {
-            if (m.member.needsRoomKey) {
+            if (m.hasJoined) {
                 return true;
             }
         }
         return false;
     }
-    async shareRoomKeyToPendingMembers(hsApi) {
-        const txn = await this._storage.readTxn([this._storage.storeNames.roomMembers]);
-        const pendingUserIds = await txn.roomMembers.getUserIdsNeedingRoomKey(this._room.id);
-        return await this._shareRoomKey(pendingUserIds, hsApi);
-    }
-    async shareRoomKeyForMemberChanges(memberChanges, hsApi) {
-        const pendingUserIds = [];
-        for (const m of memberChanges.values()) {
-            if (m.member.needsRoomKey) {
-                pendingUserIds.push(m.userId);
-            }
-        }
-        return await this._shareRoomKey(pendingUserIds, hsApi);
-    }
-    async _shareRoomKey(userIds, hsApi) {
-        if (userIds.length === 0) {
-            return;
-        }
-        const readRoomKeyTxn = await this._storage.readTxn([this._storage.storeNames.outboundGroupSessions]);
-        const roomKeyMessage = await this._megolmEncryption.createRoomKeyMessage(this._room.id, readRoomKeyTxn);
-        if (roomKeyMessage) {
-            const devices = await this._deviceTracker.devicesForRoomMembers(this._room.id, userIds, hsApi);
-            await this._sendRoomKey(roomKeyMessage, devices, hsApi);
-            const actuallySentUserIds = Array.from(devices.reduce((set, device) => set.add(device.userId), new Set()));
-            await this._clearNeedsRoomKeyFlag(actuallySentUserIds);
-        } else {
-            await this._clearNeedsRoomKeyFlag(userIds);
-        }
-    }
-    async _clearNeedsRoomKeyFlag(userIds) {
-        const txn = await this._storage.readWriteTxn([this._storage.storeNames.roomMembers]);
+    async _shareNewRoomKey(roomKeyMessage, hsApi) {
+        const devices = await this._deviceTracker.devicesForTrackedRoom(this._room.id, hsApi);
+        const userIds = Array.from(devices.reduce((set, device) => set.add(device.userId), new Set()));
+        const writeOpTxn = await this._storage.readWriteTxn([this._storage.storeNames.operations]);
+        let operationId;
         try {
-            await Promise.all(userIds.map(async userId => {
-                const memberData = await txn.roomMembers.get(this._room.id, userId);
-                if (memberData.needsRoomKey) {
-                    memberData.needsRoomKey = false;
-                    txn.roomMembers.set(memberData);
-                }
-            }));
+            operationId = this._writeRoomKeyShareOperation(roomKeyMessage, userIds, writeOpTxn);
         } catch (err) {
-            txn.abort();
+            writeOpTxn.abort();
             throw err;
         }
-        await txn.complete();
+        await writeOpTxn.complete();
+        await this._sendRoomKey(roomKeyMessage, devices, hsApi);
+        const removeOpTxn = await this._storage.readWriteTxn([this._storage.storeNames.operations]);
+        try {
+            removeOpTxn.operations.remove(operationId);
+        } catch (err) {
+            removeOpTxn.abort();
+            throw err;
+        }
+        await removeOpTxn.complete();
+    }
+    async _addShareRoomKeyOperationForNewMembers(memberChangesArray, txn) {
+        const userIds = memberChangesArray.filter(m => m.hasJoined).map(m => m.userId);
+        const roomKeyMessage = await this._megolmEncryption.createRoomKeyMessage(
+            this._room.id, txn);
+        if (roomKeyMessage) {
+            this._writeRoomKeyShareOperation(roomKeyMessage, userIds, txn);
+        }
+    }
+    _writeRoomKeyShareOperation(roomKeyMessage, userIds, txn) {
+        const id = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER).toString();
+        txn.operations.add({
+            id,
+            type: "share_room_key",
+            scope: this._room.id,
+            userIds,
+            roomKeyMessage,
+        });
+        return id;
+    }
+    async flushPendingRoomKeyShares(hsApi, operations = null) {
+        if (!operations) {
+            const txn = await this._storage.readTxn([this._storage.storeNames.operations]);
+            operations = await txn.operations.getAllByTypeAndScope("share_room_key", this._room.id);
+        }
+        for (const operation of operations) {
+            if (operation.type !== "share_room_key") {
+                continue;
+            }
+            const devices = await this._deviceTracker.devicesForRoomMembers(this._room.id, operation.userIds, hsApi);
+            await this._sendRoomKey(operation.roomKeyMessage, devices, hsApi);
+            const removeTxn = await this._storage.readWriteTxn([this._storage.storeNames.operations]);
+            try {
+                removeTxn.operations.remove(operation.id);
+            } catch (err) {
+                removeTxn.abort();
+                throw err;
+            }
+            await removeTxn.complete();
+        }
     }
     async _sendRoomKey(roomKeyMessage, devices, hsApi) {
         const messages = await this._olmEncryption.encrypt(
@@ -5049,6 +5320,9 @@ class RoomEncryption {
         };
         const txnId = makeTxnId();
         await hsApi.sendToDevice(type, payload, txnId).response();
+    }
+    dispose() {
+        this._disposed = true;
     }
 }
 class DecryptionPreparation$1 {
@@ -5218,36 +5492,50 @@ class DeviceTracker {
             "token": this._getSyncToken()
         }).response();
         const verifiedKeysPerUser = this._filterVerifiedDeviceKeys(deviceKeyResponse["device_keys"]);
-        const flattenedVerifiedKeysPerUser = verifiedKeysPerUser.reduce((all, {verifiedKeys}) => all.concat(verifiedKeys), []);
-        const deviceIdentitiesWithPossibleChangedKeys = flattenedVerifiedKeysPerUser.map(deviceKeysAsDeviceIdentity);
         const txn = await this._storage.readWriteTxn([
             this._storage.storeNames.userIdentities,
             this._storage.storeNames.deviceIdentities,
         ]);
         let deviceIdentities;
         try {
-            deviceIdentities = await Promise.all(deviceIdentitiesWithPossibleChangedKeys.map(async (deviceIdentity) => {
-                const existingDevice = await txn.deviceIdentities.get(deviceIdentity.userId, deviceIdentity.deviceId);
-                if (!existingDevice || existingDevice.ed25519Key === deviceIdentity.ed25519Key) {
-                    return deviceIdentity;
-                }
-                return null;
+            const devicesIdentitiesPerUser = await Promise.all(verifiedKeysPerUser.map(async ({userId, verifiedKeys}) => {
+                const deviceIdentities = verifiedKeys.map(deviceKeysAsDeviceIdentity);
+                return await this._storeQueriedDevicesForUserId(userId, deviceIdentities, txn);
             }));
-            deviceIdentities = deviceIdentities.filter(di => !!di);
-            for (const deviceIdentity of deviceIdentities) {
-                txn.deviceIdentities.set(deviceIdentity);
-            }
-            await Promise.all(verifiedKeysPerUser.map(async ({userId}) => {
-                const identity = await txn.userIdentities.get(userId);
-                identity.deviceTrackingStatus = TRACKING_STATUS_UPTODATE;
-                txn.userIdentities.set(identity);
-            }));
+            deviceIdentities = devicesIdentitiesPerUser.reduce((all, devices) => all.concat(devices), []);
         } catch (err) {
             txn.abort();
             throw err;
         }
         await txn.complete();
         return deviceIdentities;
+    }
+    async _storeQueriedDevicesForUserId(userId, deviceIdentities, txn) {
+        const knownDeviceIds = await txn.deviceIdentities.getAllDeviceIds(userId);
+        for (const deviceId of knownDeviceIds) {
+            if (deviceIdentities.every(di => di.deviceId !== deviceId)) {
+                txn.deviceIdentities.remove(userId, deviceId);
+            }
+        }
+        const allDeviceIdentities = [];
+        const deviceIdentitiesToStore = [];
+        deviceIdentities = await Promise.all(deviceIdentities.map(async deviceIdentity => {
+            if (knownDeviceIds.includes(deviceIdentity.deviceId)) {
+                const existingDevice = await txn.deviceIdentities.get(deviceIdentity.userId, deviceIdentity.deviceId);
+                if (existingDevice.ed25519Key !== deviceIdentity.ed25519Key) {
+                    allDeviceIdentities.push(existingDevice);
+                }
+            }
+            allDeviceIdentities.push(deviceIdentity);
+            deviceIdentitiesToStore.push(deviceIdentity);
+        }));
+        for (const deviceIdentity of deviceIdentitiesToStore) {
+            txn.deviceIdentities.set(deviceIdentity);
+        }
+        const identity = await txn.userIdentities.get(userId);
+        identity.deviceTrackingStatus = TRACKING_STATUS_UPTODATE;
+        txn.userIdentities.set(identity);
+        return allDeviceIdentities;
     }
     _filterVerifiedDeviceKeys(keyQueryDeviceKeysResponse) {
         const curve25519Keys = new Set();
@@ -5386,9 +5674,290 @@ class LockMap {
     }
 }
 
+class KeyDescription {
+    constructor(id, keyAccountData) {
+        this._id = id;
+        this._keyAccountData = keyAccountData;
+    }
+    get id() {
+        return this._id;
+    }
+    get passphraseParams() {
+        return this._keyAccountData?.content?.passphrase;
+    }
+    get algorithm() {
+        return this._keyAccountData?.content?.algorithm;
+    }
+}
+class Key {
+    constructor(keyDescription, binaryKey) {
+        this._keyDescription = keyDescription;
+        this._binaryKey = binaryKey;
+    }
+    get id() {
+        return this._keyDescription.id;
+    }
+    get binaryKey() {
+        return this._binaryKey;
+    }
+    get algorithm() {
+        return this._keyDescription.algorithm;
+    }
+}
+
+const DEFAULT_ITERATIONS = 500000;
+const DEFAULT_BITSIZE = 256;
+async function keyFromPassphrase(keyDescription, passphrase, cryptoDriver) {
+    const {passphraseParams} = keyDescription;
+    if (!passphraseParams) {
+        throw new Error("not a passphrase key");
+    }
+    if (passphraseParams.algorithm !== "m.pbkdf2") {
+        throw new Error(`Unsupported passphrase algorithm: ${passphraseParams.algorithm}`);
+    }
+    const textEncoder = new TextEncoder();
+    const keyBits = await cryptoDriver.derive.pbkdf2(
+        textEncoder.encode(passphrase),
+        passphraseParams.iterations || DEFAULT_ITERATIONS,
+        textEncoder.encode(passphraseParams.salt),
+        "SHA-512",
+        passphraseParams.bits || DEFAULT_BITSIZE);
+    return new Key(keyDescription, keyBits);
+}
+
+var buffer = class Buffer {
+    static isBuffer(array) {return array instanceof Uint8Array;}
+    static from(arrayBuffer) {return arrayBuffer;}
+    static allocUnsafe(size) {return Buffer.alloc(size);}
+    static alloc(size) {return new Uint8Array(size);}
+};
+var Buffer = buffer;
+var safeBuffer = {
+	Buffer: Buffer
+};
+var _Buffer = safeBuffer.Buffer;
+function base (ALPHABET) {
+  if (ALPHABET.length >= 255) { throw new TypeError('Alphabet too long') }
+  var BASE_MAP = new Uint8Array(256);
+  for (var j = 0; j < BASE_MAP.length; j++) {
+    BASE_MAP[j] = 255;
+  }
+  for (var i = 0; i < ALPHABET.length; i++) {
+    var x = ALPHABET.charAt(i);
+    var xc = x.charCodeAt(0);
+    if (BASE_MAP[xc] !== 255) { throw new TypeError(x + ' is ambiguous') }
+    BASE_MAP[xc] = i;
+  }
+  var BASE = ALPHABET.length;
+  var LEADER = ALPHABET.charAt(0);
+  var FACTOR = Math.log(BASE) / Math.log(256);
+  var iFACTOR = Math.log(256) / Math.log(BASE);
+  function encode (source) {
+    if (Array.isArray(source) || source instanceof Uint8Array) { source = _Buffer.from(source); }
+    if (!_Buffer.isBuffer(source)) { throw new TypeError('Expected Buffer') }
+    if (source.length === 0) { return '' }
+    var zeroes = 0;
+    var length = 0;
+    var pbegin = 0;
+    var pend = source.length;
+    while (pbegin !== pend && source[pbegin] === 0) {
+      pbegin++;
+      zeroes++;
+    }
+    var size = ((pend - pbegin) * iFACTOR + 1) >>> 0;
+    var b58 = new Uint8Array(size);
+    while (pbegin !== pend) {
+      var carry = source[pbegin];
+      var i = 0;
+      for (var it1 = size - 1; (carry !== 0 || i < length) && (it1 !== -1); it1--, i++) {
+        carry += (256 * b58[it1]) >>> 0;
+        b58[it1] = (carry % BASE) >>> 0;
+        carry = (carry / BASE) >>> 0;
+      }
+      if (carry !== 0) { throw new Error('Non-zero carry') }
+      length = i;
+      pbegin++;
+    }
+    var it2 = size - length;
+    while (it2 !== size && b58[it2] === 0) {
+      it2++;
+    }
+    var str = LEADER.repeat(zeroes);
+    for (; it2 < size; ++it2) { str += ALPHABET.charAt(b58[it2]); }
+    return str
+  }
+  function decodeUnsafe (source) {
+    if (typeof source !== 'string') { throw new TypeError('Expected String') }
+    if (source.length === 0) { return _Buffer.alloc(0) }
+    var psz = 0;
+    if (source[psz] === ' ') { return }
+    var zeroes = 0;
+    var length = 0;
+    while (source[psz] === LEADER) {
+      zeroes++;
+      psz++;
+    }
+    var size = (((source.length - psz) * FACTOR) + 1) >>> 0;
+    var b256 = new Uint8Array(size);
+    while (source[psz]) {
+      var carry = BASE_MAP[source.charCodeAt(psz)];
+      if (carry === 255) { return }
+      var i = 0;
+      for (var it3 = size - 1; (carry !== 0 || i < length) && (it3 !== -1); it3--, i++) {
+        carry += (BASE * b256[it3]) >>> 0;
+        b256[it3] = (carry % 256) >>> 0;
+        carry = (carry / 256) >>> 0;
+      }
+      if (carry !== 0) { throw new Error('Non-zero carry') }
+      length = i;
+      psz++;
+    }
+    if (source[psz] === ' ') { return }
+    var it4 = size - length;
+    while (it4 !== size && b256[it4] === 0) {
+      it4++;
+    }
+    var vch = _Buffer.allocUnsafe(zeroes + (size - it4));
+    vch.fill(0x00, 0, zeroes);
+    var j = zeroes;
+    while (it4 !== size) {
+      vch[j++] = b256[it4++];
+    }
+    return vch
+  }
+  function decode (string) {
+    var buffer = decodeUnsafe(string);
+    if (buffer) { return buffer }
+    throw new Error('Non-base' + BASE + ' character')
+  }
+  return {
+    encode: encode,
+    decodeUnsafe: decodeUnsafe,
+    decode: decode
+  }
+}
+var src = base;
+var ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+var bs58 = src(ALPHABET);
+
+const OLM_RECOVERY_KEY_PREFIX = [0x8B, 0x01];
+function keyFromRecoveryKey(olm, keyDescription, recoveryKey) {
+    const result = bs58.decode(recoveryKey.replace(/ /g, ''));
+    let parity = 0;
+    for (const b of result) {
+        parity ^= b;
+    }
+    if (parity !== 0) {
+        throw new Error("Incorrect parity");
+    }
+    for (let i = 0; i < OLM_RECOVERY_KEY_PREFIX.length; ++i) {
+        if (result[i] !== OLM_RECOVERY_KEY_PREFIX[i]) {
+            throw new Error("Incorrect prefix");
+        }
+    }
+    if (
+        result.length !==
+        OLM_RECOVERY_KEY_PREFIX.length + olm.PRIVATE_KEY_LENGTH + 1
+    ) {
+        throw new Error("Incorrect length");
+    }
+    const keyBits = Uint8Array.from(result.slice(
+        OLM_RECOVERY_KEY_PREFIX.length,
+        OLM_RECOVERY_KEY_PREFIX.length + olm.PRIVATE_KEY_LENGTH,
+    ));
+    return new Key(keyDescription, keyBits);
+}
+
+async function readDefaultKeyDescription(storage) {
+    const txn = await storage.readTxn([
+        storage.storeNames.accountData
+    ]);
+    const defaultKeyEvent = await txn.accountData.get("m.secret_storage.default_key");
+    const id = defaultKeyEvent?.content?.key;
+    if (!id) {
+        return;
+    }
+    const keyAccountData = await txn.accountData.get(`m.secret_storage.key.${id}`);
+    if (!keyAccountData) {
+        return;
+    }
+    return new KeyDescription(id, keyAccountData);
+}
+async function writeKey(key, txn) {
+    txn.session.set("ssssKey", {id: key.id, binaryKey: key.binaryKey});
+}
+async function readKey(txn) {
+    const keyData = await txn.session.get("ssssKey");
+    if (!keyData) {
+        return;
+    }
+    const keyAccountData = await txn.accountData.get(`m.secret_storage.key.${keyData.id}`);
+    return new Key(new KeyDescription(keyData.id, keyAccountData), keyData.binaryKey);
+}
+async function keyFromCredential(type, credential, storage, cryptoDriver, olm) {
+    const keyDescription = await readDefaultKeyDescription(storage);
+    if (!keyDescription) {
+        throw new Error("Could not find a default secret storage key in account data");
+    }
+    let key;
+    if (type === "passphrase") {
+        key = await keyFromPassphrase(keyDescription, credential, cryptoDriver);
+    } else if (type === "recoverykey") {
+        key = keyFromRecoveryKey(olm, keyDescription, credential);
+    } else {
+        throw new Error(`Invalid type: ${type}`);
+    }
+    return key;
+}
+
+class SecretStorage {
+    constructor({key, cryptoDriver}) {
+        this._key = key;
+        this._cryptoDriver = cryptoDriver;
+    }
+    async readSecret(name, txn) {
+        const accountData = await txn.accountData.get(name);
+        if (!accountData) {
+            return;
+        }
+        const encryptedData = accountData?.content?.encrypted?.[this._key.id];
+        if (!encryptedData) {
+            throw new Error(`Secret ${accountData.type} is not encrypted for key ${this._key.id}`);
+        }
+        if (this._key.algorithm === "m.secret_storage.v1.aes-hmac-sha2") {
+            return await this._decryptAESSecret(accountData.type, encryptedData);
+        } else {
+            throw new Error(`Unsupported algorithm for key ${this._key.id}: ${this._key.algorithm}`);
+        }
+    }
+    async _decryptAESSecret(type, encryptedData) {
+        const textEncoder = new TextEncoder();
+        const textDecoder = new TextDecoder();
+        const hkdfKey = await this._cryptoDriver.derive.hkdf(
+            this._key.binaryKey,
+            new Uint8Array(8).buffer,
+            textEncoder.encode(type),
+            "SHA-256",
+            512
+        );
+        const aesKey = hkdfKey.slice(0, 32);
+        const hmacKey = hkdfKey.slice(32);
+        const ciphertextBytes = base64Arraybuffer.decode(encryptedData.ciphertext);
+        const isVerified = await this._cryptoDriver.hmac.verify(
+            hmacKey, base64Arraybuffer.decode(encryptedData.mac),
+            ciphertextBytes, "SHA-256");
+        if (!isVerified) {
+            throw new Error("Bad MAC");
+        }
+        const plaintextBytes = await this._cryptoDriver.aes.decrypt(
+            aesKey, base64Arraybuffer.decode(encryptedData.iv), ciphertextBytes);
+        return textDecoder.decode(plaintextBytes);
+    }
+}
+
 const PICKLE_KEY = "DEFAULT_KEY";
 class Session$1 {
-    constructor({clock, storage, hsApi, sessionInfo, olm, workerPool}) {
+    constructor({clock, storage, hsApi, sessionInfo, olm, olmWorker, cryptoDriver}) {
         this._clock = clock;
         this._storage = storage;
         this._hsApi = hsApi;
@@ -5407,7 +5976,8 @@ class Session$1 {
         this._megolmEncryption = null;
         this._megolmDecryption = null;
         this._getSyncToken = () => this.syncToken;
-        this._workerPool = workerPool;
+        this._olmWorker = olmWorker;
+        this._cryptoDriver = cryptoDriver;
         if (olm) {
             this._olmUtil = new olm.Utility();
             this._deviceTracker = new DeviceTracker({
@@ -5419,6 +5989,7 @@ class Session$1 {
             });
         }
         this._createRoomEncryption = this._createRoomEncryption.bind(this);
+        this.needsSessionBackup = new ObservableValue(false);
     }
     _setupEncryption() {
         console.log("loaded e2ee account with keys", this._e2eeAccount.identityKeys);
@@ -5453,7 +6024,7 @@ class Session$1 {
         this._megolmDecryption = new Decryption$1({
             pickleKey: PICKLE_KEY,
             olm: this._olm,
-            workerPool: this._workerPool,
+            olmWorker: this._olmWorker,
         });
         this._deviceMessageHandler.enableEncryption({olmDecryption, megolmDecryption: this._megolmDecryption});
     }
@@ -5471,8 +6042,47 @@ class Session$1 {
             megolmEncryption: this._megolmEncryption,
             megolmDecryption: this._megolmDecryption,
             storage: this._storage,
-            encryptionParams
+            sessionBackup: this._sessionBackup,
+            encryptionParams,
+            notifyMissingMegolmSession: () => {
+                if (!this._sessionBackup) {
+                    this.needsSessionBackup.set(true);
+                }
+            },
+            clock: this._clock
         });
+    }
+    async enableSecretStorage(type, credential) {
+        if (!this._olm) {
+            throw new Error("olm required");
+        }
+        const key = await keyFromCredential(type, credential, this._storage, this._cryptoDriver, this._olm);
+        const readTxn = await this._storage.readTxn([
+            this._storage.storeNames.accountData,
+        ]);
+        await this._createSessionBackup(key, readTxn);
+        const writeTxn = await this._storage.readWriteTxn([
+            this._storage.storeNames.session,
+        ]);
+        try {
+            writeKey(key, writeTxn);
+        } catch (err) {
+            writeTxn.abort();
+            throw err;
+        }
+        await writeTxn.complete();
+    }
+    async _createSessionBackup(ssssKey, txn) {
+        const secretStorage = new SecretStorage({key: ssssKey, cryptoDriver: this._cryptoDriver});
+        this._sessionBackup = await SessionBackup.fromSecretStorage({olm: this._olm, secretStorage, hsApi: this._hsApi, txn});
+        if (this._sessionBackup) {
+            for (const room of this._rooms.values()) {
+                if (room.isEncrypted) {
+                    room.enableSessionBackup(this._sessionBackup);
+                }
+            }
+        }
+        this.needsSessionBackup.set(false);
     }
     async beforeFirstSync(isNewLogin) {
         if (this._olm) {
@@ -5480,28 +6090,28 @@ class Session$1 {
                 throw new Error("there should not be an e2ee account already on a fresh login");
             }
             if (!this._e2eeAccount) {
-                const txn = await this._storage.readWriteTxn([
-                    this._storage.storeNames.session
-                ]);
-                try {
-                    this._e2eeAccount = await Account.create({
-                        hsApi: this._hsApi,
-                        olm: this._olm,
-                        pickleKey: PICKLE_KEY,
-                        userId: this._sessionInfo.userId,
-                        deviceId: this._sessionInfo.deviceId,
-                        txn
-                    });
-                } catch (err) {
-                    txn.abort();
-                    throw err;
-                }
-                await txn.complete();
+                this._e2eeAccount = await Account.create({
+                    hsApi: this._hsApi,
+                    olm: this._olm,
+                    pickleKey: PICKLE_KEY,
+                    userId: this._sessionInfo.userId,
+                    deviceId: this._sessionInfo.deviceId,
+                    olmWorker: this._olmWorker,
+                    storage: this._storage,
+                });
                 this._setupEncryption();
             }
             await this._e2eeAccount.generateOTKsIfNeeded(this._storage);
             await this._e2eeAccount.uploadKeys(this._storage);
             await this._deviceMessageHandler.decryptPending(this.rooms);
+            const txn = await this._storage.readTxn([
+                this._storage.storeNames.session,
+                this._storage.storeNames.accountData,
+            ]);
+            const ssssKey = await readKey(txn);
+            if (ssssKey) {
+                await this._createSessionBackup(ssssKey, txn);
+            }
         }
     }
     async load() {
@@ -5521,6 +6131,7 @@ class Session$1 {
                 pickleKey: PICKLE_KEY,
                 userId: this._sessionInfo.userId,
                 deviceId: this._sessionInfo.deviceId,
+                olmWorker: this._olmWorker,
                 txn
             });
             if (this._e2eeAccount) {
@@ -5537,9 +6148,13 @@ class Session$1 {
     get isStarted() {
         return this._sendScheduler.isStarted;
     }
-    stop() {
-        this._workerPool?.dispose();
+    dispose() {
+        this._olmWorker?.dispose();
         this._sendScheduler.stop();
+        this._sessionBackup?.dispose();
+        for (const room of this._rooms.values()) {
+            room.dispose();
+        }
     }
     async start(lastVersionResponse) {
         if (lastVersionResponse) {
@@ -5549,9 +6164,19 @@ class Session$1 {
             txn.session.set("serverVersions", lastVersionResponse);
             await txn.complete();
         }
+        const opsTxn = await this._storage.readWriteTxn([
+            this._storage.storeNames.operations
+        ]);
+        const operations = await opsTxn.operations.getAll();
+        const operationsByScope = groupBy(operations, o => o.scope);
         this._sendScheduler.start();
         for (const [, room] of this._rooms) {
-            room.start();
+            let roomOperationsByType;
+            const roomOperations = operationsByScope.get(room.id);
+            if (roomOperations) {
+                roomOperationsByType = groupBy(roomOperations, r => r.type);
+            }
+            room.start(roomOperationsByType);
         }
     }
     async _getPendingEventsByRoom(txn) {
@@ -5579,7 +6204,8 @@ class Session$1 {
             sendScheduler: this._sendScheduler,
             pendingEvents,
             user: this._user,
-            createRoomEncryption: this._createRoomEncryption
+            createRoomEncryption: this._createRoomEncryption,
+            clock: this._clock
         });
         this._rooms.add(roomId, room);
         return room;
@@ -5605,6 +6231,14 @@ class Session$1 {
         const toDeviceEvents = syncResponse.to_device?.events;
         if (Array.isArray(toDeviceEvents)) {
             this._deviceMessageHandler.writeSync(toDeviceEvents, txn);
+        }
+        const accountData = syncResponse["account_data"];
+        if (Array.isArray(accountData?.events)) {
+            for (const event of accountData.events) {
+                if (typeof event.type === "string") {
+                    txn.accountData.set(event);
+                }
+            }
         }
         return changes;
     }
@@ -5652,7 +6286,7 @@ const LoginFailure = createEnum(
     "Unknown",
 );
 class SessionContainer {
-    constructor({clock, random, onlineStatus, request, storageFactory, sessionInfoStorage, olmPromise, workerPromise}) {
+    constructor({clock, random, onlineStatus, request, storageFactory, sessionInfoStorage, olmPromise, workerPromise, cryptoDriver}) {
         this._random = random;
         this._clock = clock;
         this._onlineStatus = onlineStatus;
@@ -5669,6 +6303,7 @@ class SessionContainer {
         this._storage = null;
         this._olmPromise = olmPromise;
         this._workerPromise = workerPromise;
+        this._cryptoDriver = cryptoDriver;
     }
     createNewSessionId() {
         return (Math.floor(this._random() * Number.MAX_SAFE_INTEGER)).toString();
@@ -5754,13 +6389,13 @@ class SessionContainer {
             homeServer: sessionInfo.homeServer,
         };
         const olm = await this._olmPromise;
-        let workerPool = null;
+        let olmWorker = null;
         if (this._workerPromise) {
-            workerPool = await this._workerPromise;
+            olmWorker = await this._workerPromise;
         }
         this._session = new Session$1({storage: this._storage,
             sessionInfo: filteredSessionInfo, hsApi, olm,
-            clock: this._clock, workerPool});
+            clock: this._clock, olmWorker, cryptoDriver: this._cryptoDriver});
         await this._session.load();
         this._status.set(LoadStatus.SessionSetup);
         await this._session.beforeFirstSync(isNewLogin);
@@ -5819,7 +6454,7 @@ class SessionContainer {
     get reconnector() {
         return this._reconnector;
     }
-    stop() {
+    dispose() {
         if (this._reconnectSubscription) {
             this._reconnectSubscription();
             this._reconnectSubscription = null;
@@ -5828,7 +6463,7 @@ class SessionContainer {
             this._sync.stop();
         }
         if (this._session) {
-            this._session.stop();
+            this._session.dispose();
         }
         if (this._waitForFirstSyncHandle) {
             this._waitForFirstSyncHandle.dispose();
@@ -5864,6 +6499,8 @@ const STORE_NAMES = Object.freeze([
     "inboundGroupSessions",
     "outboundGroupSessions",
     "groupSessionDecryptions",
+    "operations",
+    "accountData",
 ]);
 const STORE_MAP = Object.freeze(STORE_NAMES.reduce((nameMap, name) => {
     nameMap[name] = name;
@@ -6459,20 +7096,6 @@ class RoomMemberStore {
         });
         return userIds;
     }
-    async getUserIdsNeedingRoomKey(roomId) {
-        const userIds = [];
-        const range = IDBKeyRange.lowerBound(encodeKey$1(roomId, ""));
-        await this._roomMembersStore.iterateWhile(range, member => {
-            if (member.roomId !== roomId) {
-                return false;
-            }
-            if (member.needsRoomKey) {
-                userIds.push(member.userId);
-            }
-            return true;
-        });
-        return userIds;
-    }
 }
 
 function encodeKey$2(roomId, fragmentId) {
@@ -6575,6 +7198,10 @@ class UserIdentityStore {
 function encodeKey$4(userId, deviceId) {
     return `${userId}|${deviceId}`;
 }
+function decodeKey$2(key) {
+    const [userId, deviceId] = key.split("|");
+    return {userId, deviceId};
+}
 class DeviceIdentityStore {
     constructor(store) {
         this._store = store;
@@ -6584,6 +7211,19 @@ class DeviceIdentityStore {
         return this._store.selectWhile(range, device => {
             return device.userId === userId;
         });
+    }
+    async getAllDeviceIds(userId) {
+        const deviceIds = [];
+        const range = IDBKeyRange.lowerBound(encodeKey$4(userId, ""));
+        await this._store.iterateKeys(range, key => {
+            const decodedKey = decodeKey$2(key);
+            if (decodedKey.userId === userId) {
+                deviceIds.push(decodedKey.deviceId);
+                return false;
+            }
+            return true;
+        });
+        return deviceIds;
     }
     get(userId, deviceId) {
         return this._store.get(encodeKey$4(userId, deviceId));
@@ -6595,12 +7235,15 @@ class DeviceIdentityStore {
     getByCurve25519Key(curve25519Key) {
         return this._store.index("byCurve25519Key").get(curve25519Key);
     }
+    remove(userId, deviceId) {
+        this._store.delete(encodeKey$4(userId, deviceId));
+    }
 }
 
 function encodeKey$5(senderKey, sessionId) {
     return `${senderKey}|${sessionId}`;
 }
-function decodeKey$2(key) {
+function decodeKey$3(key) {
     const [senderKey, sessionId] = key.split("|");
     return {senderKey, sessionId};
 }
@@ -6612,7 +7255,7 @@ class OlmSessionStore {
         const sessionIds = [];
         const range = IDBKeyRange.lowerBound(encodeKey$5(senderKey, ""));
         await this._store.iterateKeys(range, key => {
-            const decodedKey = decodeKey$2(key);
+            const decodedKey = decodeKey$3(key);
             if (decodedKey.senderKey === senderKey) {
                 sessionIds.push(decodedKey.sessionId);
                 return false;
@@ -6685,22 +7328,63 @@ class GroupSessionDecryptionStore {
     get(roomId, sessionId, messageIndex) {
         return this._store.get(encodeKey$7(roomId, sessionId, messageIndex));
     }
-    set(decryption) {
-        decryption.key = encodeKey$7(decryption.roomId, decryption.sessionId, decryption.messageIndex);
+    set(roomId, sessionId, messageIndex, decryption) {
+        decryption.key = encodeKey$7(roomId, sessionId, messageIndex);
         this._store.put(decryption);
     }
+}
+
+function encodeTypeScopeKey(type, scope) {
+    return `${type}|${scope}`;
+}
+class OperationStore {
+    constructor(store) {
+        this._store = store;
+    }
+    getAll() {
+        return this._store.selectAll();
+    }
+    async getAllByTypeAndScope(type, scope) {
+        const key = encodeTypeScopeKey(type, scope);
+        const results = [];
+        await this._store.index("byTypeAndScope").iterateWhile(key, value => {
+            if (value.typeScopeKey !== key) {
+                return false;
+            }
+            results.push(value);
+            return true;
+        });
+        return results;
+    }
+    add(operation) {
+        operation.typeScopeKey = encodeTypeScopeKey(operation.type, operation.scope);
+        this._store.add(operation);
+    }
+    update(operation) {
+        this._store.set(operation);
+    }
+    remove(id) {
+        this._store.delete(id);
+    }
+}
+
+class AccountDataStore {
+	constructor(store) {
+		this._store = store;
+	}
+	async get(type) {
+		return await this._store.get(type);
+	}
+	set(event) {
+		return this._store.put(event);
+	}
 }
 
 class Transaction {
     constructor(txn, allowedStoreNames) {
         this._txn = txn;
         this._allowedStoreNames = allowedStoreNames;
-        this._stores = {
-            session: null,
-            roomSummary: null,
-            roomTimeline: null,
-            roomState: null,
-        };
+        this._stores = {};
     }
     _idbStore(name) {
         if (!this._allowedStoreNames.includes(name)) {
@@ -6753,6 +7437,12 @@ class Transaction {
     }
     get groupSessionDecryptions() {
         return this._store("groupSessionDecryptions", idbStore => new GroupSessionDecryptionStore(idbStore));
+    }
+    get operations() {
+        return this._store("operations", idbStore => new OperationStore(idbStore));
+    }
+    get accountData() {
+        return this._store("accountData", idbStore => new AccountDataStore(idbStore));
     }
     complete() {
         return txnAsPromise(this._txn);
@@ -6829,12 +7519,9 @@ const schema = [
     createInitialStores,
     createMemberStore,
     migrateSession,
-    createIdentityStores,
-    createOlmSessionStore,
-    createInboundGroupSessionsStore,
-    createOutboundGroupSessionsStore,
-    createGroupSessionDecryptions,
-    addSenderKeyIndexToDeviceStore
+    createE2EEStores,
+    migrateEncryptionFlag,
+    createAccountDataStore
 ];
 function createInitialStores(db) {
     db.createObjectStore("session", {keyPath: "key"});
@@ -6875,28 +7562,38 @@ async function migrateSession(db, txn) {
         console.error("could not migrate session", err.stack);
     }
 }
-function createIdentityStores(db) {
+function createE2EEStores(db) {
     db.createObjectStore("userIdentities", {keyPath: "userId"});
-    db.createObjectStore("deviceIdentities", {keyPath: "key"});
-}
-function createOlmSessionStore(db) {
-    db.createObjectStore("olmSessions", {keyPath: "key"});
-}
-function createInboundGroupSessionsStore(db) {
-    db.createObjectStore("inboundGroupSessions", {keyPath: "key"});
-}
-function createOutboundGroupSessionsStore(db) {
-    db.createObjectStore("outboundGroupSessions", {keyPath: "roomId"});
-}
-function createGroupSessionDecryptions(db) {
-    db.createObjectStore("groupSessionDecryptions", {keyPath: "key"});
-}
-function addSenderKeyIndexToDeviceStore(db, txn) {
-    const deviceIdentities = txn.objectStore("deviceIdentities");
+    const deviceIdentities = db.createObjectStore("deviceIdentities", {keyPath: "key"});
     deviceIdentities.createIndex("byCurve25519Key", "curve25519Key", {unique: true});
+    db.createObjectStore("olmSessions", {keyPath: "key"});
+    db.createObjectStore("inboundGroupSessions", {keyPath: "key"});
+    db.createObjectStore("outboundGroupSessions", {keyPath: "roomId"});
+    db.createObjectStore("groupSessionDecryptions", {keyPath: "key"});
+    const operations = db.createObjectStore("operations", {keyPath: "id"});
+    operations.createIndex("byTypeAndScope", "typeScopeKey", {unique: false});
+}
+async function migrateEncryptionFlag(db, txn) {
+    const roomSummary = txn.objectStore("roomSummary");
+    const roomState = txn.objectStore("roomState");
+    const summaries = [];
+    await iterateCursor(roomSummary.openCursor(), summary => {
+        summaries.push(summary);
+    });
+    for (const summary of summaries) {
+        const encryptionEntry = await reqAsPromise(roomState.get(`${summary.roomId}|m.room.encryption|`));
+        if (encryptionEntry) {
+            summary.encryption = encryptionEntry?.event?.content;
+            delete summary.isEncrypted;
+            roomSummary.put(summary);
+        }
+    }
+}
+function createAccountDataStore(db) {
+    db.createObjectStore("accountData", {keyPath: "type"});
 }
 
-const sessionName = sessionId => `brawl_session_${sessionId}`;
+const sessionName = sessionId => `hydrogen_session_${sessionId}`;
 const openDatabaseWithSessionId = sessionId => openDatabase(sessionName(sessionId), createStores, schema.length);
 class StorageFactory {
     async create(sessionId) {
@@ -6999,6 +7696,7 @@ class ViewModel extends EventEmitter {
     constructor({clock, emitChange} = {}) {
         super();
         this.disposables = null;
+        this._isDisposed = false;
         this._options = {clock, emitChange};
     }
     childOptions(explicitOptions) {
@@ -7014,6 +7712,10 @@ class ViewModel extends EventEmitter {
         if (this.disposables) {
             this.disposables.dispose();
         }
+        this._isDisposed = true;
+    }
+    get isDisposed() {
+        return this._isDisposed;
     }
     disposeTracked(disposable) {
         if (this.disposables) {
@@ -7140,10 +7842,14 @@ class RoomTileViewModel extends ViewModel {
 }
 
 class UpdateAction {
-    constructor(remove, update, updateParams) {
+    constructor(remove, update, replace, updateParams) {
         this._remove = remove;
         this._update = update;
+        this._replace = replace;
         this._updateParams = updateParams;
+    }
+    get shouldReplace() {
+        return this._replace;
     }
     get shouldRemove() {
         return this._remove;
@@ -7155,13 +7861,16 @@ class UpdateAction {
         return this._updateParams;
     }
     static Remove() {
-        return new UpdateAction(true, false, null);
+        return new UpdateAction(true, false, false, null);
     }
     static Update(newParams) {
-        return new UpdateAction(false, true, newParams);
+        return new UpdateAction(false, true, false, newParams);
     }
     static Nothing() {
-        return new UpdateAction(false, false, null);
+        return new UpdateAction(false, false, false, null);
+    }
+    static Replace() {
+        return new UpdateAction(false, false, true, null);
     }
 }
 
@@ -7266,6 +7975,9 @@ class TilesCollection extends BaseObservableList {
         const tile = this._findTileAtIdx(entry, tileIdx);
         if (tile) {
             const action = tile.updateEntry(entry, params);
+            if (action.shouldReplace) {
+                this._replaceTile(tileIdx, tile, this._tileCreator(entry));
+            }
             if (action.shouldRemove) {
                 this._removeTile(tileIdx, tile);
             }
@@ -7274,13 +7986,24 @@ class TilesCollection extends BaseObservableList {
             }
         }
     }
+    _replaceTile(tileIdx, existingTile, newTile) {
+        existingTile.dispose();
+        const prevTile = this._getTileAtIdx(tileIdx - 1);
+        const nextTile = this._getTileAtIdx(tileIdx + 1);
+        this._tiles[tileIdx] = newTile;
+        prevTile?.updateNextSibling(newTile);
+        newTile.updatePreviousSibling(prevTile);
+        newTile.updateNextSibling(nextTile);
+        nextTile?.updatePreviousSibling(newTile);
+        this.emitUpdate(tileIdx, newTile, null);
+    }
     _removeTile(tileIdx, tile) {
         const prevTile = this._getTileAtIdx(tileIdx - 1);
         const nextTile = this._getTileAtIdx(tileIdx + 1);
         this._tiles.splice(tileIdx, 1);
         prevTile && prevTile.updateNextSibling(nextTile);
         nextTile && nextTile.updatePreviousSibling(prevTile);
-        tile.setUpdateEmit(null);
+        tile.dispose();
         this.emitRemove(tileIdx, tile);
     }
     onRemove(index, entry) {
@@ -7329,7 +8052,13 @@ class SimpleTile extends ViewModel {
         return this._entry.isPending;
     }
     setUpdateEmit(emitUpdate) {
-        this.updateOptions({emitChange: paramName => emitUpdate(this, paramName)});
+        this.updateOptions({emitChange: paramName => {
+            if (emitUpdate) {
+                emitUpdate(this, paramName);
+            } else {
+                console.trace("Tile is emitting event after being disposed");
+            }
+        }});
     }
     get upperEntry() {
         return this._entry;
@@ -7340,9 +8069,9 @@ class SimpleTile extends ViewModel {
     compareEntry(entry) {
         return this._entry.compare(entry);
     }
-    updateEntry(entry) {
+    updateEntry(entry, params) {
         this._entry = entry;
-        return UpdateAction.Nothing();
+        return UpdateAction.Update(params);
     }
     removeEntry(entry) {
         return true;
@@ -7353,6 +8082,10 @@ class SimpleTile extends ViewModel {
     updatePreviousSibling(prev) {
     }
     updateNextSibling(next) {
+    }
+    dispose() {
+        this.setUpdateEmit(null);
+        super.dispose();
     }
 }
 
@@ -7416,8 +8149,11 @@ class MessageTile extends SimpleTile {
     get shape() {
         return "message";
     }
+    get displayName() {
+        return this._entry.displayName || this.sender;
+    }
     get sender() {
-        return this._entry.displayName || this._entry.sender;
+        return this._entry.sender;
     }
     get avatarColorNumber() {
         return getIdentifierColorNumber(this._entry.sender);
@@ -7432,7 +8168,7 @@ class MessageTile extends SimpleTile {
         return avatarInitials(this.sender);
     }
     get avatarTitle() {
-        return this.sender;
+        return this.displayName;
     }
     get date() {
         return this._date && this._date.toLocaleDateString({}, {month: "numeric", day: "numeric"});
@@ -7535,7 +8271,7 @@ class RoomNameTile extends SimpleTile {
     }
     get announcement() {
         const content = this._entry.content;
-        return `${this._entry.displayName || this._entry.sender} named the room "${content.name}"`
+        return `${this._entry.displayName || this._entry.sender} named the room "${content?.name}"`
     }
 }
 
@@ -7580,8 +8316,35 @@ class RoomMemberTile extends SimpleTile {
 }
 
 class EncryptedEventTile extends MessageTile {
+    updateEntry(entry, params) {
+        const parentResult = super.updateEntry(entry, params);
+        if (entry.eventType !== "m.room.encrypted") {
+            return UpdateAction.Replace();
+        } else {
+            return parentResult;
+        }
+    }
+    get shape() {
+        return "message-status"
+    }
     get text() {
-        return this.i18n`**Encrypted message**`;
+        const decryptionError = this._entry.decryptionError;
+        const code = decryptionError?.code;
+        if (code === "MEGOLM_NO_SESSION") {
+            return this.i18n`The sender hasn't sent us the key for this message yet.`;
+        } else {
+            return decryptionError?.message || this.i18n`"Could not decrypt message because of unknown reason."`;
+        }
+    }
+}
+
+class EncryptionEnabledTile extends SimpleTile {
+    get shape() {
+        return "announcement";
+    }
+    get announcement() {
+        const senderName =  this._entry.displayName || this._entry.sender;
+        return this.i18n`${senderName} has enabled end-to-end encryption`;
     }
 }
 
@@ -7615,6 +8378,8 @@ function tilesCreator({room, ownUserId, clock}) {
                     return new RoomMemberTile(options);
                 case "m.room.encrypted":
                     return new EncryptedEventTile(options);
+                case "m.room.encryption":
+                    return new EncryptionEnabledTile(options);
                 default:
                     return null;
             }
@@ -7630,9 +8395,12 @@ class TimelineViewModel extends ViewModel {
         this._tiles = new TilesCollection(timeline.entries, tilesCreator({room, ownUserId, clock: this.clock}));
     }
     async loadAtTop() {
+        if (this.isDisposed) {
+            return true;
+        }
         const firstTile = this._tiles.getFirst();
         if (firstTile.shape === "gap") {
-            return firstTile.fill();
+            return await firstTile.fill();
         } else {
             await this._timeline.loadAtTop(10);
             return false;
@@ -7709,6 +8477,9 @@ class RoomViewModel extends ViewModel {
     get timelineViewModel() {
         return this._timelineVM;
     }
+    get isEncrypted() {
+        return this._room.isEncrypted;
+    }
     get error() {
         if (this._timelineError) {
             return `Something went wrong loading the timeline: ${this._timelineError.message}`;
@@ -7758,6 +8529,9 @@ class ComposerViewModel extends ViewModel {
         this._roomVM = roomVM;
         this._isEmpty = true;
     }
+    get isEncrypted() {
+        return this._roomVM.isEncrypted;
+    }
     sendMessage(message) {
         const success = this._roomVM._sendMessage(message);
         if (success) {
@@ -7786,18 +8560,22 @@ const SessionStatus = createEnum(
 class SessionStatusViewModel extends ViewModel {
     constructor(options) {
         super(options);
-        const {sync, reconnector} = options;
+        const {sync, reconnector, session} = options;
         this._sync = sync;
         this._reconnector = reconnector;
         this._status = this._calculateState(reconnector.connectionStatus.get(), sync.status.get());
+        this._session = session;
     }
     start() {
         const update = () => this._updateStatus();
         this.track(this._sync.status.subscribe(update));
         this.track(this._reconnector.connectionStatus.subscribe(update));
+        this.track(this._session.needsSessionBackup.subscribe(() => {
+            this.emitChange();
+        }));
     }
     get isShown() {
-        return this._status !== SessionStatus.Syncing;
+        return this._session.needsSessionBackup.get() || this._status !== SessionStatus.Syncing;
     }
     get statusLabel() {
         switch (this._status) {
@@ -7811,6 +8589,9 @@ class SessionStatusViewModel extends ViewModel {
                 return this.i18n`Catching up with your conversations…`;
             case SessionStatus.SyncError:
                 return this.i18n`Sync failed because of ${this._sync.error}`;
+        }
+        if (this._session.needsSessionBackup.get()) {
+            return this.i18n`Set up secret storage to decrypt older messages.`;
         }
         return "";
     }
@@ -7865,9 +8646,22 @@ class SessionStatusViewModel extends ViewModel {
     get isConnectNowShown() {
         return this._status === SessionStatus.Disconnected;
     }
+    get isSecretStorageShown() {
+        return this._status === SessionStatus.Syncing && this._session.needsSessionBackup.get();
+    }
     connectNow() {
         if (this.isConnectNowShown) {
             this._reconnector.tryNow();
+        }
+    }
+    async enterPassphrase(passphrase) {
+        if (passphrase) {
+            try {
+                await this._session.enableSecretStorage("recoverykey", passphrase);
+            } catch (err) {
+                console.error(err);
+                alert(`Could not set up secret storage: ${err.message}`);
+            }
         }
     }
 }
@@ -7879,7 +8673,8 @@ class SessionViewModel extends ViewModel {
         this._session = sessionContainer.session;
         this._sessionStatusViewModel = this.track(new SessionStatusViewModel(this.childOptions({
             sync: sessionContainer.sync,
-            reconnector: sessionContainer.reconnector
+            reconnector: sessionContainer.reconnector,
+            session: sessionContainer.session,
         })));
         this._currentRoomTileViewModel = null;
         this._currentRoomViewModel = null;
@@ -7975,7 +8770,7 @@ class SessionLoadViewModel extends ViewModel {
     async cancel() {
         try {
             if (this._sessionContainer) {
-                this._sessionContainer.stop();
+                this._sessionContainer.dispose();
                 if (this._deleteSessionOnCancel) {
                     await this._sessionContainer.deleteSession();
                 }
@@ -8812,9 +9607,18 @@ for (const [ns, tags] of Object.entries(TAG_NAMES)) {
 }
 
 function spinner(t, extraClasses = undefined) {
-    return t.svg({className: Object.assign({"spinner": true}, extraClasses), viewBox:"0 0 100 100"},
-        t.circle({cx:"50%", cy:"50%", r:"45%", pathLength:"100"})
-    );
+    if (document.body.classList.contains("ie11")) {
+        return t.div({className: "spinner"}, [
+            t.div(),
+            t.div(),
+            t.div(),
+            t.div(),
+        ]);
+    } else {
+        return t.svg({className: Object.assign({"spinner": true}, extraClasses), viewBox:"0 0 100 100"},
+            t.circle({cx:"50%", cy:"50%", r:"45%", pathLength:"100"})
+        );
+    }
 }
 function renderAvatar(t, vm, size) {
     const hasAvatar = !!vm.avatarUrl;
@@ -8865,10 +9669,11 @@ function renderMessage(t, vm, children) {
         pending: vm.isPending,
         unverified: vm.isUnverified,
         continuation: vm => vm.isContinuation,
+        messageStatus: vm => vm.shape === "message-status",
     };
     const profile = t.div({className: "profile"}, [
         renderAvatar(t, vm, 30),
-        t.div({className: `sender usercolor${vm.avatarColorNumber}`}, vm.sender)
+        t.div({className: `sender usercolor${vm.avatarColorNumber}`}, vm.displayName)
     ]);
     children = [profile].concat(children);
     return t.li(
@@ -8880,7 +9685,7 @@ function renderMessage(t, vm, children) {
 class TextMessageView extends TemplateView {
     render(t, vm) {
         return renderMessage(t, vm,
-            [t.p([vm.text, t.time({className: {hidden: !vm.date}}, vm.date + " " + vm.time)])]
+            [t.p([vm => vm.text, t.time({className: {hidden: !vm.date}}, vm.date + " " + vm.time)])]
         );
     }
 }
@@ -8923,7 +9728,9 @@ class TimelineList extends ListView {
             switch (entry.shape) {
                 case "gap": return new GapView(entry);
                 case "announcement": return new AnnouncementView(entry);
-                case "message": return new TextMessageView(entry);
+                case "message":
+                case "message-status":
+                    return new TextMessageView(entry);
                 case "image": return new ImageView(entry);
             }
         });
@@ -9008,7 +9815,7 @@ class TimelineLoadingView extends TemplateView {
     render(t, vm) {
         return t.div({className: "TimelineLoadingView"}, [
             spinner(t),
-            t.div(vm.i18n`Loading messages…`)
+            t.div(vm.isEncrypted ? vm.i18n`Loading encrypted messages…` : vm.i18n`Loading messages…`)
         ]);
     }
 }
@@ -9020,7 +9827,7 @@ class MessageComposer extends TemplateView {
     }
     render(t, vm) {
         this._input = t.input({
-            placeholder: "Send a message ...",
+            placeholder: vm.isEncrypted ? "Send an encrypted message…" : "Send a message…",
             onKeydown: e => this._onKeyDown(e),
             onInput: () => vm.setInput(this._input.value),
         });
@@ -9129,6 +9936,7 @@ class SessionStatusView extends TemplateView {
             spinner(t, {hidden: vm => !vm.isWaiting}),
             t.p(vm => vm.statusLabel),
             t.if(vm => vm.isConnectNowShown, t.createTemplate(t => t.button({onClick: () => vm.connectNow()}, "Retry now"))),
+            t.if(vm => vm.isSecretStorageShown, t.createTemplate(t => t.button({onClick: () => vm.enterPassphrase(prompt("Security key"))}, "Enter security key"))),
             window.DEBUG ? t.button({id: "showlogs"}, "Show logs") : ""
         ]);
     }
@@ -9489,6 +10297,187 @@ class OnlineStatus extends BaseObservableValue {
     }
 }
 
+function subtleCryptoResult(promiseOrOp, method) {
+    if (promiseOrOp instanceof Promise) {
+        return promiseOrOp;
+    } else {
+        return new Promise((resolve, reject) => {
+            promiseOrOp.oncomplete = e => resolve(e.target.result);
+            promiseOrOp.onerror = () => reject(new Error("Crypto error on " + method));
+        });
+    }
+}
+class CryptoHMACDriver {
+    constructor(subtleCrypto) {
+        this._subtleCrypto = subtleCrypto;
+    }
+    async verify(key, mac, data, hash) {
+        const opts = {
+            name: 'HMAC',
+            hash: {name: hashName(hash)},
+        };
+        const hmacKey = await subtleCryptoResult(this._subtleCrypto.importKey(
+            'raw',
+            key,
+            opts,
+            false,
+            ['verify'],
+        ), "importKey");
+        const isVerified = await subtleCryptoResult(this._subtleCrypto.verify(
+            opts,
+            hmacKey,
+            mac,
+            data,
+        ), "verify");
+        return isVerified;
+    }
+    async compute(key, data, hash) {
+        const opts = {
+            name: 'HMAC',
+            hash: {name: hashName(hash)},
+        };
+        const hmacKey = await subtleCryptoResult(this._subtleCrypto.importKey(
+            'raw',
+            key,
+            opts,
+            false,
+            ['sign'],
+        ), "importKey");
+        const buffer = await subtleCryptoResult(this._subtleCrypto.sign(
+            opts,
+            hmacKey,
+            data,
+        ), "sign");
+        return new Uint8Array(buffer);
+    }
+}
+class CryptoDeriveDriver {
+    constructor(subtleCrypto, cryptoDriver, cryptoExtras) {
+        this._subtleCrypto = subtleCrypto;
+        this._cryptoDriver = cryptoDriver;
+        this._cryptoExtras = cryptoExtras;
+    }
+    async pbkdf2(password, iterations, salt, hash, length) {
+        if (!this._subtleCrypto.deriveBits) {
+            throw new Error("PBKDF2 is not supported");
+        }
+        const key = await subtleCryptoResult(this._subtleCrypto.importKey(
+            'raw',
+            password,
+            {name: 'PBKDF2'},
+            false,
+            ['deriveBits'],
+        ), "importKey");
+        const keybits = await subtleCryptoResult(this._subtleCrypto.deriveBits(
+            {
+                name: 'PBKDF2',
+                salt,
+                iterations,
+                hash: hashName(hash),
+            },
+            key,
+            length,
+        ), "deriveBits");
+        return new Uint8Array(keybits);
+    }
+    async hkdf(key, salt, info, hash, length) {
+        if (!this._subtleCrypto.deriveBits) {
+            return this._cryptoExtras.hkdf(this._cryptoDriver, key, salt, info, hash, length);
+        }
+        const hkdfkey = await subtleCryptoResult(this._subtleCrypto.importKey(
+            'raw',
+            key,
+            {name: "HKDF"},
+            false,
+            ["deriveBits"],
+        ), "importKey");
+        const keybits = await subtleCryptoResult(this._subtleCrypto.deriveBits({
+                name: "HKDF",
+                salt,
+                info,
+                hash: hashName(hash),
+            },
+            hkdfkey,
+            length,
+        ), "deriveBits");
+        return new Uint8Array(keybits);
+    }
+}
+class CryptoAESDriver {
+    constructor(subtleCrypto) {
+        this._subtleCrypto = subtleCrypto;
+    }
+    async decrypt(key, iv, ciphertext) {
+        const opts = {
+            name: "AES-CTR",
+            counter: iv,
+            length: 64,
+        };
+        let aesKey;
+        try {
+            aesKey = await subtleCryptoResult(this._subtleCrypto.importKey(
+                'raw',
+                key,
+                opts,
+                false,
+                ['decrypt'],
+            ), "importKey");
+        } catch (err) {
+            throw new Error(`Could not import key for AES-CTR decryption: ${err.message}`);
+        }
+        try {
+            const plaintext = await subtleCryptoResult(this._subtleCrypto.decrypt(
+                opts,
+                aesKey,
+                ciphertext,
+            ), "decrypt");
+            return new Uint8Array(plaintext);
+        } catch (err) {
+            throw new Error(`Could not decrypt with AES-CTR: ${err.message}`);
+        }
+    }
+}
+class CryptoLegacyAESDriver {
+    constructor(aesjs) {
+        this._aesjs = aesjs;
+    }
+    async decrypt(key, iv, ciphertext) {
+        const aesjs = this._aesjs;
+        var aesCtr = new aesjs.ModeOfOperation.ctr(new Uint8Array(key), new aesjs.Counter(new Uint8Array(iv)));
+        return aesCtr.decrypt(new Uint8Array(ciphertext));
+    }
+}
+function hashName(name) {
+    if (name !== "SHA-256" && name !== "SHA-512") {
+        throw new Error(`Invalid hash name: ${name}`);
+    }
+    return name;
+}
+class CryptoDriver {
+    constructor(cryptoExtras) {
+        const crypto = window.crypto || window.msCrypto;
+        const subtleCrypto = crypto.subtle || crypto.webkitSubtle;
+        this._subtleCrypto = subtleCrypto;
+        if (!subtleCrypto.deriveBits && cryptoExtras.aesjs) {
+            this.aes = new CryptoLegacyAESDriver(cryptoExtras.aesjs);
+        } else {
+            this.aes = new CryptoAESDriver(subtleCrypto);
+        }
+        this.hmac = new CryptoHMACDriver(subtleCrypto);
+        this.derive = new CryptoDeriveDriver(subtleCrypto, this, cryptoExtras);
+    }
+    async digest(hash, data) {
+        return await subtleCryptoResult(this._subtleCrypto.digest(hashName(hash), data));
+    }
+    digestSize(hash) {
+        switch (hashName(hash)) {
+            case "SHA-512": return 64;
+            case "SHA-256": return 32;
+            default: throw new Error(`Not implemented for ${hashName(hash)}`);
+        }
+    }
+}
+
 class WorkerState {
     constructor(worker) {
         this.worker = worker;
@@ -9659,6 +10648,30 @@ class WorkerPool {
     }
 }
 
+class OlmWorker {
+    constructor(workerPool) {
+        this._workerPool = workerPool;
+    }
+    megolmDecrypt(session, ciphertext) {
+        const sessionKey = session.export_session(session.first_known_index());
+        return this._workerPool.send({type: "megolm_decrypt", ciphertext, sessionKey});
+    }
+    async createAccountAndOTKs(account, otkAmount) {
+        let randomValues;
+        if (window.msCrypto) {
+            randomValues = [
+                window.msCrypto.getRandomValues(new Uint8Array(64)),
+                window.msCrypto.getRandomValues(new Uint8Array(otkAmount * 32)),
+            ];
+        }
+        const pickle = await this._workerPool.send({type: "olm_create_account_otks", randomValues, otkAmount}).response();
+        account.unpickle("", pickle);
+    }
+    dispose() {
+        this._workerPool.dispose();
+    }
+}
+
 function addScript(src) {
     return new Promise(function (resolve, reject) {
         var s = document.createElement("script");
@@ -9690,15 +10703,22 @@ function relPath(path, basePath) {
     const dirCount = dir.length ? dir.split("/").length : 0;
     return "../".repeat(dirCount) + path;
 }
-async function loadWorker(paths) {
+async function loadOlmWorker(paths) {
     const workerPool = new WorkerPool(paths.worker, 4);
     await workerPool.init();
     const path = relPath(paths.olm.legacyBundle, paths.worker);
     await workerPool.sendAll({type: "load_olm", path});
-    return workerPool;
+    const olmWorker = new OlmWorker(workerPool);
+    return olmWorker;
 }
-async function main(container, paths) {
+async function main(container, paths, legacyExtras) {
     try {
+        const isIE11 = !!window.MSInputMethodContext && !!document.documentMode;
+        if (isIE11) {
+            document.body.className += " ie11";
+        } else {
+            document.body.className += " not-ie11";
+        }
         const clock = new Clock();
         let request;
         if (typeof fetch === "function") {
@@ -9708,9 +10728,10 @@ async function main(container, paths) {
         }
         const sessionInfoStorage = new SessionInfoStorage("brawl_sessions_v1");
         const storageFactory = new StorageFactory();
+        const olmPromise = loadOlm(paths.olm);
         let workerPromise;
         if (!window.WebAssembly) {
-            workerPromise = loadWorker(paths);
+            workerPromise = loadOlmWorker(paths);
         }
         const vm = new BrawlViewModel({
             createSessionContainer: () => {
@@ -9721,7 +10742,8 @@ async function main(container, paths) {
                     sessionInfoStorage,
                     request,
                     clock,
-                    olmPromise: loadOlm(paths.olm),
+                    cryptoDriver: new CryptoDriver(legacyExtras?.crypto),
+                    olmPromise,
                     workerPromise,
                 });
             },

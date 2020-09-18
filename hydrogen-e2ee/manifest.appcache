@@ -1,11 +1,12 @@
 CACHE MANIFEST
-# v0.0.34
+# v0.0.37
 NETWORK
 "*"
 CACHE
-hydrogen-legacy-802196391.js
-hydrogen-2287382861.css
+hydrogen-legacy-3637924516.js
+hydrogen-1625084908.css
 index.html
-icon-192.png
-themes/element/bundle-4290731165.css
+icon-317721575.png
+icon-3866575052.svg
+themes/element/bundle-1000196323.css
 themes/bubbles/bundle-2682099160.css
